@@ -1,0 +1,33 @@
+# Basic configuration template. Fill API keys via GitHub Secrets or local env.
+data:
+  price_period: "3y"
+  price_interval: "1d"
+  cache_dir: "cache"
+
+universe:
+  source: "sp500"   # placeholder
+  min_volume: 100000
+
+allocation:
+  min_stocks: 10
+  max_stocks: 50
+  max_position_pct: 0.10
+  max_sector_pct: 0.35
+  cash_buffer: 0.02
+
+regime:
+  model: "hmm"   # placeholder
+
+execution:
+  atr_multiplier: 1.0
+  slippage_pct: 0.001
+
+report:
+  output_dir: "reports"
+
+email:
+  enabled: false
+  smtp_host: "smtp.example.com"
+  smtp_port: 587
+  from_addr: "robot@example.com"
+  to_addr: "you@example.com"
