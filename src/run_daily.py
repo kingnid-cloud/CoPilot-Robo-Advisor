@@ -9,6 +9,17 @@ from pathlib import Path
 import pandas as pd
 import datetime
 import logging
+# at top of src/run_daily.py (after other imports)
+from src.utils.secrets import load_secrets, missing_secrets
+
+# load secrets from environment
+secrets = load_secrets()
+missing = missing_secrets(secrets)
+if missing:
+    logger.warning("The following repository secrets are missing or empty: %s", missing)
+else:
+    logger.info("All expected secrets are present.")
+# Use secrets['ALPHAVANTAGE_KEY'] etc. when calling API clients
 
 from src.data.collector import DataCollector
 from src.scoring.fundamentals import FundamentalScorer
