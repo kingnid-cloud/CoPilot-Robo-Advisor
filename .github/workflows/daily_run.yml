@@ -27,14 +27,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
+          # try fallbacks for known problematic packages
+          pip install ta==0.12.0 || pip install ta==0.11.0
+          pip install logdna==2.0.0 || pip install logdna==1.18.12
+          pip install -r requirements.txt --no-deps || true
           pip install -r requirements.txt
 
-      
-        run: |
-          python scripts/smtp_test.py
-
-      - name: Run daily pipeline
+      - name: Run daily pipeline (produce report)
         env:
           # Market data
           ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
@@ -45,19 +45,12 @@ jobs:
           ROIC_API_KEY: ${{ secrets.ROIC_API_KEY }}
           TICKERBOT_API_KEY: ${{ secrets.TICKERBOT_API_KEY }}
 
-          # Brokerage / test accounts
+          # Brokerage / test accounts (if needed)
           RH_TEST_ACCOUNT_NUMBER: ${{ secrets.RH_TEST_ACCOUNT_NUMBER }}
           RH_TEST_EMAIL: ${{ secrets.RH_TEST_EMAIL }}
           RH_TEST_PASSWORD: ${{ secrets.RH_TEST_PASSWORD }}
-          
-          # Communication
-          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
-          EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          TO_EMAIL: ${{ secrets.TO_EMAIL }}
-          
-          # Feature flags / runtime toggles
+
+          # Feature flags
           ENABLE_LIVE: ${{ secrets.ENABLE_LIVE }}
           ENABLE_EMAIL: ${{ secrets.ENABLE_EMAIL }}
 
@@ -65,7 +58,21 @@ jobs:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           LOGDNA_KEY: ${{ secrets.LOGDNA_KEY }}
         run: |
+          # Run the repo's daily pipeline; ensure it writes a report to reports/
           python -m src.run_daily --config config.yaml
+
+      - name: Send report by email
+        if: always()
+        env:
+          EMAIL_SMTP_HOST: ${{ secrets.EMAIL_SMTP_HOST }}
+          EMAIL_SMTP_PORT: ${{ secrets.EMAIL_SMTP_PORT }}
+          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
+          EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: |
+          # Adjust this command to match your repo's email-sender script
+          python scripts/send_report_email.py --file reports/daily_screening.csv --subject "Daily Robo Screening Report"
 
       - name: Upload reports artifact
         if: always()
