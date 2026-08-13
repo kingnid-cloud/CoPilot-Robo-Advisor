@@ -1,0 +1,58 @@
+# CoPilot_Robo_Advisor
+
+A modular robo-advisor prototype: data collection, regime detection, scoring, allocation, execution signals, backtest, and scheduled runs.
+
+This repo is designed for non-developers. Follow the step-by-step instructions below to get the system running on GitHub Actions (workdays) and locally.
+
+## Quick overview
+- **Run daily**: `src/run_daily.py` produces `reports/` (CSV + HTML).
+- **Prototype**: `notebooks/prototype_colab.ipynb` for interactive testing.
+- **Scheduling**: `.github/workflows/daily_run.yml` runs Monday–Friday.
+- **Secrets**: store API keys in GitHub Secrets (see below).
+
+## Files included
+- `requirements.txt`
+- `config.yaml` (template)
+- `src/` (modules and `run_daily.py`)
+- `.github/workflows/daily_run.yml`
+- `notebooks/prototype_colab.ipynb` (Colab-ready)
+- `tests/` (basic unit tests)
+
+## Setup (non-technical)
+1. Create a GitHub repo named `CoPilot_Robo_Advisor` (you already did).
+2. Add these files to the repo (upload or push via Git).
+3. Add GitHub Secrets: `ALPHAVANTAGE_KEY`, `FMP_KEY`, `EMAIL_SMTP_USER`, `EMAIL_SMTP_PASS` (optional), `ENABLE_LIVE` (set to `false` by default).
+4. Actions will run automatically on workdays. Check **Actions** tab for logs and artifacts.
+
+## Run locally (optional)
+1. Install Python 3.10+.
+2. Create and activate a virtual environment:
+   - macOS/Linux:
+     ```
+     python3 -m venv venv
+     source venv/bin/activate
+     ```
+   - Windows:
+     ```
+     python -m venv venv
+     venv\Scripts\activate
+     ```
+3. Install dependencies:
+pip install -r requirements.txt
+
+4. Run:
+python -m src.run_daily --config config.yaml
+
+5. Open `reports/` to view CSV and HTML outputs.
+
+## Notes and safety
+- Live trading is **disabled by default**. Enable only after careful review.
+- Free-tier APIs are supported; the code uses caching and polite retries.
+- The system is a research tool and not financial advice.
+
+## Support
+If you want, I will:
+- Walk you through adding the files to GitHub step-by-step.
+- Help add your API keys to GitHub Secrets.
+- Run the first workflow and interpret the report.
+
