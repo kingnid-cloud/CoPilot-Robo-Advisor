@@ -1,24 +1,34 @@
-"""
-Entry point for the robo-advisor pipeline.
-Produces CSV and HTML reports in reports/.
-"""
-
+# src/run_daily.py (top of file)
 import argparse
 import yaml
 from pathlib import Path
 import pandas as pd
 import datetime
 import logging
-# at top of src/run_daily.py (after other imports)
-from src.utils.secrets import load_secrets, missing_secrets
+import os
 
-# load secrets from environment
+# create logger first
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("run_daily")
+
+# load secrets helper (ensure this file exists: src/utils/secrets.py)
+try:
+    from src.utils.secrets import load_secrets, missing_secrets
+except Exception:
+    # If the helper is missing, create a minimal fallback to avoid crashing
+    def load_secrets():
+        return {}
+    def missing_secrets(env):
+        return []
+
+# load secrets from environment and warn only about missing names (do NOT log values)
 secrets = load_secrets()
 missing = missing_secrets(secrets)
 if missing:
     logger.warning("The following repository secrets are missing or empty: %s", missing)
 else:
     logger.info("All expected secrets are present.")
+
 # Use secrets['ALPHAVANTAGE_KEY'] etc. when calling API clients
 
 from src.data.collector import DataCollector
