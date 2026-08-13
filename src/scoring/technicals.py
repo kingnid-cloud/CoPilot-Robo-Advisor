@@ -7,6 +7,9 @@ Computes simple moving averages and RSI and returns a small score dict.
 import pandas as pd
 from ta.momentum import RSIIndicator
 from typing import Dict
+import logging
+
+logger = logging.getLogger("TechnicalScorer")
 
 class TechnicalScorer:
     def __init__(self):
