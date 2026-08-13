@@ -44,16 +44,11 @@ def _safe_get_json(url: str, params: Dict[str, Any], headers: Optional[Dict[str,
     return None
 
 def call_tickerbot(symbol: str, api_key: str) -> Optional[Dict]:
-    """
-    Query Tickerbot enrichment API.
-    Expected behavior: returns a JSON object with keys like 'ticker', 'name', 'sector', 'industry', 'fundamentals' etc.
-    Replace the URL and parsing as needed for your Tickerbot plan.
-    """
     if not api_key:
         logger.debug("Tickerbot key missing")
         return None
 
-    url = "https://api.tickerbot.io/v1/enrich"  # example endpoint; adjust if your plan uses a different path
+    url = "https://api.tickerbot.io/v1/enrich"
     params = {"symbol": symbol}
     headers = {"Authorization": f"Bearer {api_key}"}
     logger.info("Tickerbot: requesting enrichment for %s", symbol)
@@ -62,7 +57,6 @@ def call_tickerbot(symbol: str, api_key: str) -> Optional[Dict]:
     if not data:
         return None
 
-    # Normalize common fields into a simple dict
     out = {}
     try:
         out["provider"] = "tickerbot"
@@ -70,16 +64,14 @@ def call_tickerbot(symbol: str, api_key: str) -> Optional[Dict]:
         out["name"] = data.get("name") or data.get("companyName")
         out["sector"] = data.get("sector") or data.get("industrySector")
         out["industry"] = data.get("industry") or data.get("industryGroup")
-        # fundamentals may be nested; attempt common keys
         fundamentals = data.get("fundamentals") or data.get("metrics") or {}
         out["fundamentals"] = fundamentals
-        # flatten some common metrics if present
         out["ROIC"] = fundamentals.get("roic") or fundamentals.get("ROIC")
         out["PEG"] = fundamentals.get("peg") or fundamentals.get("PEG")
         out["GrossMargin"] = fundamentals.get("grossMargin") or fundamentals.get("gross_margin")
     except Exception as e:
         logger.warning("Tickerbot parse error for %s: %s", symbol, e)
-        return data  # return raw if parsing failed
+        return data
 
     return out
 
@@ -119,9 +111,6 @@ def call_finnhub(symbol: str, api_key: str) -> Optional[Dict]:
     return data
 
 def _cache_result(symbol: str, provider: str, payload: Dict) -> None:
-    """
-    Simple JSON cache per symbol/provider to avoid repeated API calls in CI.
-    """
     try:
         p = CACHE_DIR / f"{symbol}_{provider}.json"
         with p.open("w", encoding="utf-8") as f:
@@ -141,12 +130,6 @@ def _load_cached(symbol: str, provider: str) -> Optional[Dict]:
         return None
 
 def fetch_fundamental_with_fallback(symbol: str, secrets: Dict[str, str], use_cache: bool = True) -> Optional[Dict]:
-    """
-    Try providers in order: Tickerbot -> FMP -> AlphaVantage -> Finnhub.
-    Caches per-provider JSON to CACHE_DIR to reduce repeated calls.
-    Returns the first successful parsed dict or None.
-    """
-    # 1) Tickerbot
     tb_key = secrets.get("TICKERBOT_API_KEY")
     if tb_key:
         if use_cache:
@@ -163,7 +146,6 @@ def fetch_fundamental_with_fallback(symbol: str, secrets: Dict[str, str], use_ca
         except Exception as e:
             logger.warning("Tickerbot failed for %s: %s", symbol, e)
 
-    # 2) FMP
     fmp_key = secrets.get("FMP_KEY")
     if fmp_key:
         if use_cache:
@@ -180,7 +162,6 @@ def fetch_fundamental_with_fallback(symbol: str, secrets: Dict[str, str], use_ca
         except Exception as e:
             logger.warning("FMP failed for %s: %s", symbol, e)
 
-    # 3) AlphaVantage
     av_key = secrets.get("ALPHAVANTAGE_KEY")
     if av_key:
         if use_cache:
@@ -197,7 +178,6 @@ def fetch_fundamental_with_fallback(symbol: str, secrets: Dict[str, str], use_ca
         except Exception as e:
             logger.warning("AlphaVantage failed for %s: %s", symbol, e)
 
-    # 4) Finnhub
     fh_key = secrets.get("FINNHUB_API_KEY")
     if fh_key:
         if use_cache:
