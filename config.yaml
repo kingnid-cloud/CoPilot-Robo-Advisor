@@ -26,7 +26,7 @@ report:
   output_dir: "reports"
 
 email:
-  enabled: false
+  enabled: true
   smtp_host: "smtp.example.com"
   smtp_port: 587
   from_addr: "robot@example.com"
