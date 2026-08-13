@@ -39,7 +39,6 @@ jobs:
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
         run: |
           python scripts/smtp_test.py
-
       - name: Run daily pipeline
         
 
