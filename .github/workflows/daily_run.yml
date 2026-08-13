@@ -61,18 +61,45 @@ jobs:
           # Run the repo's daily pipeline; ensure it writes a report to reports/
           python -m src.run_daily --config config.yaml
 
-      - name: Send report by email
+      - name: Fail if browsing metadata present in report
+        run: |
+          REPORT="reports/daily_screening.csv"
+          if [ -f "$REPORT" ]; then
+            if grep -q "edge_all_open_tabs" "$REPORT" || grep -q "WebsiteContent_yivqn" "$REPORT"; then
+              echo "Found browsing metadata in $REPORT — aborting send."
+              exit 1
+            fi
+          else
+            echo "Report not found at $REPORT; skipping metadata check."
+          fi
+
+      - name: Send report by email (Gmail)
         if: always()
         env:
-          EMAIL_SMTP_HOST: ${{ secrets.EMAIL_SMTP_HOST }}
-          EMAIL_SMTP_PORT: ${{ secrets.EMAIL_SMTP_PORT }}
+          # SMTP host/port (Gmail defaults)
+          EMAIL_SMTP_HOST: smtp.gmail.com
+          EMAIL_SMTP_PORT: 587
+
+          # Preferred Gmail secrets
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+
+          # Fallback secret names (if you used different names)
           EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
           EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
+          EMAILAPPPASSWORD: ${{ secrets.EMAILAPPPASSWORD }}
+
+          # From / To
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
         run: |
-          # Adjust this command to match your repo's email-sender script
-          python scripts/send_report_email.py --file reports/daily_screening.csv --subject "Daily Robo Screening Report"
+          REPORT_FILE="reports/daily_screening.csv"
+          if [ ! -f "$REPORT_FILE" ]; then
+            echo "Report not found at $REPORT_FILE"
+            ls -la reports || true
+            exit 2
+          fi
+          python scripts/send_report_email.py --file "$REPORT_FILE" --subject "CoPilot Stock Report"
 
       - name: Upload reports artifact
         if: always()
