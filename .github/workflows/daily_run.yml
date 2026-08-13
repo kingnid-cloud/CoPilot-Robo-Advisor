@@ -39,10 +39,10 @@ jobs:
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
         run: |
           python scripts/smtp_test.py
+      
       - name: Run daily pipeline
-        
-
-          # Market data / fundamentals / alternative data APIs
+                 
+          # Market data
           ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
           FMP_KEY: ${{ secrets.FMP_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
