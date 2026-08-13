@@ -26,9 +26,9 @@ jobs:
           ROIC_API_KEY: ${{ secrets.ROIC_API_KEY }}
           TICKERBOT_API_KEY: ${{ secrets.TICKERBOT_API_KEY }}
           EmailAppPassword: ${{ secrets.EmailAppPassword }}
-          GMAIL_APP_PASSWORD: ${{ secrets.EmailAppPassword }}
-          EMAIL_SMTP_USER: ${{ secrets.GMAIL_USER }}
-          EMAIL_SMTP_PASS: ${{ secrets.EmailAppPassword }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
+          EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
           RH_TEST_ACCOUNT_NUMBER: ${{ secrets.RH_TEST_ACCOUNT_NUMBER }}
           RH_TEST_EMAIL: ${{ secrets.RH_TEST_EMAIL }}
           RH_TEST_PASSWORD: ${{ secrets.RH_TEST_PASSWORD }}
