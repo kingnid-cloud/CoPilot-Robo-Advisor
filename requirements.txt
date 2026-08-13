@@ -30,4 +30,4 @@ flake8==6.0.0
 
 # Observability / optional connectors
 sentry-sdk==1.20.0
-logdna==2.0.0
+logdna==1.18.12
