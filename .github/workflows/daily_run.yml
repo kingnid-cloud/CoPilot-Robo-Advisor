@@ -41,13 +41,7 @@ jobs:
           python scripts/smtp_test.py
 
       - name: Run daily pipeline
-        env:
-          # Email / SMTP
-          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
-          EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        
 
           # Market data / fundamentals / alternative data APIs
           ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
