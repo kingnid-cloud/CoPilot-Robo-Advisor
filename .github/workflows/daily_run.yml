@@ -33,8 +33,6 @@ jobs:
           RH_TEST_EMAIL: ${{ secrets.RH_TEST_EMAIL }}
           RH_TEST_PASSWORD: ${{ secrets.RH_TEST_PASSWORD }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
-          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
-          EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
           ENABLE_LIVE: ${{ secrets.ENABLE_LIVE }}
         run: |
           python -m src.run_daily --config config.yaml
