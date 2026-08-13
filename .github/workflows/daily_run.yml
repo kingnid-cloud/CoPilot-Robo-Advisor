@@ -2,7 +2,7 @@ name: Daily Robo Run
 
 on:
   schedule:
-    - cron: '0 14 * * 1-5'  # Runs Monday-Friday at 14:00 UTC
+    - cron: '0 14 * * 1-5'
   workflow_dispatch: {}
 
 jobs:
@@ -20,9 +20,21 @@ jobs:
         env:
           ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
           FMP_KEY: ${{ secrets.FMP_KEY }}
-          ENABLE_LIVE: ${{ secrets.ENABLE_LIVE }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          SimFin: ${{ secrets.SimFin }}
+          ROIC_API_KEY: ${{ secrets.ROIC_API_KEY }}
+          TICKERBOT_API_KEY: ${{ secrets.TICKERBOT_API_KEY }}
+          EmailAppPassword: ${{ secrets.EmailAppPassword }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          RH_TEST_ACCOUNT_NUMBER: ${{ secrets.RH_TEST_ACCOUNT_NUMBER }}
+          RH_TEST_EMAIL: ${{ secrets.RH_TEST_EMAIL }}
+          RH_TEST_PASSWORD: ${{ secrets.RH_TEST_PASSWORD }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
           EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
           EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
+          ENABLE_LIVE: ${{ secrets.ENABLE_LIVE }}
         run: |
           python -m src.run_daily --config config.yaml
       - name: Upload reports
