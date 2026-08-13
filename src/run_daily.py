@@ -1,145 +1,218 @@
-# src/run_daily.py
+# src/data/connectors.py
 """
-Main pipeline entrypoint for daily run.
-- Loads config.yaml
-- Loads secrets via src.utils.secrets
-- Uses DataCollector to fetch tickers, prices, fundamentals
-- Runs TechnicalScorer and FundamentalScorer
-- Writes CSV and HTML reports to reports/
-- Optionally sends email when ENABLE_EMAIL is true and secrets present
+API connector helpers with Tickerbot integration and fallback strategy.
+
+Order of preference for fundamentals/enrichment:
+  1. Tickerbot (rich metadata, sector/industry, fundamentals)
+  2. FinancialModelingPrep (FMP)
+  3. AlphaVantage
+  4. Finnhub
+
+Behavior:
+- Each provider call returns a parsed dict or None.
+- fetch_fundamental_with_fallback tries providers in order and returns the first successful result.
+- Functions are defensive: they log and return None on errors.
+- Caller should cache results to disk to avoid repeated calls in CI.
 """
-import argparse
+
+from typing import Optional, Dict, Any
+import time
 import logging
-import os
+import requests
 from pathlib import Path
-import yaml
-import pandas as pd
-from datetime import datetime
-from src.utils.secrets import load_secrets, missing_secrets, safe_get
-from src.data.collector import DataCollector
-from src.scoring.technicals import TechnicalScorer
-from src.scoring.fundamentals import FundamentalScorer
-import smtplib, ssl
-from email.message import EmailMessage
+import json
 
-# logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("run_daily")
+logger = logging.getLogger("connectors")
+logger.setLevel(logging.INFO)
 
-REPORT_DIR = Path("reports")
-REPORT_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_TIMEOUT = 15.0
+RATE_LIMIT_SLEEP = 1.0  # base sleep between calls to avoid bursts
+CACHE_DIR = Path("cache")  # connectors may use DataCollector's cache; keep consistent
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-def send_email(smtp_user: str, smtp_pass: str, to_addr: str, subject: str, body: str, smtp_host="smtp.gmail.com", smtp_port=587):
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = smtp_user
-    msg["To"] = to_addr
-    msg.set_content(body)
-    context = ssl.create_default_context()
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
-        s.ehlo()
-        s.starttls(context=context)
-        s.ehlo()
-        s.login(smtp_user, smtp_pass)
-        s.send_message(msg)
-    logger.info("Email sent to %s", to_addr)
+def _safe_get_json(url: str, params: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout: float = DEFAULT_TIMEOUT) -> Optional[Dict]:
+    try:
+        r = requests.get(url, params=params, headers=headers or {}, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.HTTPError as he:
+        logger.warning("HTTP error for %s: %s", url, he)
+    except requests.exceptions.RequestException as re:
+        logger.warning("Network error for %s: %s", url, re)
+    except ValueError as ve:
+        logger.warning("Invalid JSON from %s: %s", url, ve)
+    return None
 
-def load_config(path: str) -> dict:
-    with open(path, "r") as f:
-        return yaml.safe_load(f) or {}
+def call_tickerbot(symbol: str, api_key: str) -> Optional[Dict]:
+    """
+    Query Tickerbot enrichment API.
+    Expected behavior: returns a JSON object with keys like 'ticker', 'name', 'sector', 'industry', 'fundamentals' etc.
+    Replace the URL and parsing as needed for your Tickerbot plan.
+    """
+    if not api_key:
+        logger.debug("Tickerbot key missing")
+        return None
 
-def build_reports(final_df: pd.DataFrame, run_date: str) -> (Path, Path):
-    csv_path = REPORT_DIR / f"final_portfolio_{run_date}.csv"
-    html_path = REPORT_DIR / f"final_portfolio_{run_date}.html"
-    final_df.to_csv(csv_path, index=False)
-    final_df.to_html(html_path, index=False)
-    logger.info("Reports: %s, %s", csv_path, html_path)
-    return csv_path, html_path
+    url = "https://api.tickerbot.io/v1/enrich"  # example endpoint; adjust if your plan uses a different path
+    params = {"symbol": symbol}
+    headers = {"Authorization": f"Bearer {api_key}"}
+    logger.info("Tickerbot: requesting enrichment for %s", symbol)
+    data = _safe_get_json(url, params=params, headers=headers)
+    time.sleep(RATE_LIMIT_SLEEP)
+    if not data:
+        return None
 
-def run(config_path: str):
-    cfg = load_config(config_path)
-    secrets = load_secrets()
-    missing = missing_secrets(secrets)
-    if missing:
-        logger.warning("The following repository secrets are missing or empty: %s", missing)
-    else:
-        logger.info("All expected secrets present.")
+    # Normalize common fields into a simple dict
+    out = {}
+    try:
+        out["provider"] = "tickerbot"
+        out["ticker"] = data.get("ticker") or symbol
+        out["name"] = data.get("name") or data.get("companyName")
+        out["sector"] = data.get("sector") or data.get("industrySector")
+        out["industry"] = data.get("industry") or data.get("industryGroup")
+        # fundamentals may be nested; attempt common keys
+        fundamentals = data.get("fundamentals") or data.get("metrics") or {}
+        out["fundamentals"] = fundamentals
+        # flatten some common metrics if present
+        out["ROIC"] = fundamentals.get("roic") or fundamentals.get("ROIC")
+        out["PEG"] = fundamentals.get("peg") or fundamentals.get("PEG")
+        out["GrossMargin"] = fundamentals.get("grossMargin") or fundamentals.get("gross_margin")
+    except Exception as e:
+        logger.warning("Tickerbot parse error for %s: %s", symbol, e)
+        return data  # return raw if parsing failed
 
-    run_date = datetime.utcnow().strftime("%Y-%m-%d")
-    logger.info("Starting pipeline: %s", run_date)
+    return out
 
-    # Data collector
-    dc = DataCollector()
+def call_fmp(symbol: str, api_key: str) -> Optional[Dict]:
+    if not api_key:
+        logger.debug("FMP key missing")
+        return None
+    url = f"https://financialmodelingprep.com/api/v3/profile/{symbol}"
+    params = {"apikey": api_key}
+    logger.info("FMP: requesting profile for %s", symbol)
+    data = _safe_get_json(url, params)
+    time.sleep(RATE_LIMIT_SLEEP)
+    if isinstance(data, list) and data:
+        return data[0]
+    return None
 
-    # tickers
-    tickers = dc.fetch_tickers(Path(cfg.get("data", {}).get("tickers_csv", "")) if cfg.get("data", {}).get("tickers_csv") else None)
+def call_alphavantage(symbol: str, api_key: str) -> Optional[Dict]:
+    if not api_key:
+        logger.debug("AlphaVantage key missing")
+        return None
+    url = "https://www.alphavantage.co/query"
+    params = {"function": "OVERVIEW", "symbol": symbol, "apikey": api_key}
+    logger.info("AlphaVantage: requesting overview for %s", symbol)
+    data = _safe_get_json(url, params)
+    time.sleep(RATE_LIMIT_SLEEP)
+    return data
 
-    # fetch prices (bulk)
-    price_period = cfg.get("data", {}).get("price_period", "3y")
-    price_interval = cfg.get("data", {}).get("price_interval", "1d")
-    price_data = dc.fetch_prices_bulk(tickers, period=price_period, interval=price_interval)
+def call_finnhub(symbol: str, api_key: str) -> Optional[Dict]:
+    if not api_key:
+        logger.debug("Finnhub key missing")
+        return None
+    url = "https://finnhub.io/api/v1/stock/profile2"
+    params = {"symbol": symbol, "token": api_key}
+    logger.info("Finnhub: requesting profile for %s", symbol)
+    data = _safe_get_json(url, params)
+    time.sleep(RATE_LIMIT_SLEEP)
+    return data
 
-    # fetch fundamentals
-    fundamentals_df = dc.fetch_fundamentals(tickers)
-    fundamentals_df = fundamentals_df.reset_index().rename(columns={"index": "ticker"})
+def _cache_result(symbol: str, provider: str, payload: Dict) -> None:
+    """
+    Simple JSON cache per symbol/provider to avoid repeated API calls in CI.
+    """
+    try:
+        p = CACHE_DIR / f"{symbol}_{provider}.json"
+        with p.open("w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception:
+        logger.exception("Failed to write connector cache for %s/%s", symbol, provider)
 
-    # prepare metrics DataFrame for scoring
-    metrics_df = fundamentals_df.copy()
-    # ensure sector column exists for percentile grouping
-    if "sector" not in metrics_df.columns:
-        metrics_df["sector"] = cfg.get("defaults", {}).get("sector", "GLOBAL")
+def _load_cached(symbol: str, provider: str) -> Optional[Dict]:
+    p = CACHE_DIR / f"{symbol}_{provider}.json"
+    if not p.exists():
+        return None
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logger.warning("Failed to read connector cache for %s/%s", symbol, provider)
+        return None
 
-    # scoring
-    tech = TechnicalScorer()
-    fund = FundamentalScorer(cfg)
+def fetch_fundamental_with_fallback(symbol: str, secrets: Dict[str, str], use_cache: bool = True) -> Optional[Dict]:
+    """
+    Try providers in order: Tickerbot -> FMP -> AlphaVantage -> Finnhub.
+    Caches per-provider JSON to CACHE_DIR to reduce repeated calls.
+    Returns the first successful parsed dict or None.
+    """
+    # 1) Tickerbot
+    tb_key = secrets.get("TICKERBOT_API_KEY")
+    if tb_key:
+        if use_cache:
+            cached = _load_cached(symbol, "tickerbot")
+            if cached:
+                logger.info("Using cached Tickerbot for %s", symbol)
+                return cached
+        try:
+            res = call_tickerbot(symbol, tb_key)
+            if res:
+                _cache_result(symbol, "tickerbot", res)
+                logger.info("Fetched fundamentals for %s from Tickerbot", symbol)
+                return res
+        except Exception as e:
+            logger.warning("Tickerbot failed for %s: %s", symbol, e)
 
-    # compute technical scores per ticker
-    tech_scores = []
-    for t in tickers:
-        df_price = price_data.get(t, pd.DataFrame())
-        ts = tech.score_from_price(df_price)
-        tech_scores.append({"ticker": t, "tech_score": ts.get("score", 0.0), "tech_signal": ts.get("signal", 0.0)})
-    tech_df = pd.DataFrame(tech_scores)
+    # 2) FMP
+    fmp_key = secrets.get("FMP_KEY")
+    if fmp_key:
+        if use_cache:
+            cached = _load_cached(symbol, "fmp")
+            if cached:
+                logger.info("Using cached FMP for %s", symbol)
+                return cached
+        try:
+            res = call_fmp(symbol, fmp_key)
+            if res:
+                _cache_result(symbol, "fmp", res)
+                logger.info("Fetched fundamentals for %s from FMP", symbol)
+                return res
+        except Exception as e:
+            logger.warning("FMP failed for %s: %s", symbol, e)
 
-    # compute fundamental scores
-    fund_scores_df = fund.score_company_metrics(metrics_df)
+    # 3) AlphaVantage
+    av_key = secrets.get("ALPHAVANTAGE_KEY")
+    if av_key:
+        if use_cache:
+            cached = _load_cached(symbol, "alphavantage")
+            if cached:
+                logger.info("Using cached AlphaVantage for %s", symbol)
+                return cached
+        try:
+            res = call_alphavantage(symbol, av_key)
+            if res:
+                _cache_result(symbol, "alphavantage", res)
+                logger.info("Fetched fundamentals for %s from AlphaVantage", symbol)
+                return res
+        except Exception as e:
+            logger.warning("AlphaVantage failed for %s: %s", symbol, e)
 
-    # merge results
-    merged = fund_scores_df.reset_index().rename(columns={"index": "ticker"}).merge(tech_df, on="ticker", how="left")
-    merged["tech_score"] = merged["tech_score"].fillna(0.0)
-    merged["final_score"] = merged["fund_score"] * cfg.get("weights", {}).get("fund", 0.7) + merged["tech_score"] * cfg.get("weights", {}).get("tech", 0.3)
+    # 4) Finnhub
+    fh_key = secrets.get("FINNHUB_API_KEY")
+    if fh_key:
+        if use_cache:
+            cached = _load_cached(symbol, "finnhub")
+            if cached:
+                logger.info("Using cached Finnhub for %s", symbol)
+                return cached
+        try:
+            res = call_finnhub(symbol, fh_key)
+            if res:
+                _cache_result(symbol, "finnhub", res)
+                logger.info("Fetched fundamentals for %s from Finnhub", symbol)
+                return res
+        except Exception as e:
+            logger.warning("Finnhub failed for %s: %s", symbol, e)
 
-    # simple portfolio selection: top N by final_score
-    top_n = cfg.get("portfolio", {}).get("top_n", 10)
-    final_portfolio = merged.sort_values("final_score", ascending=False).head(top_n)
-    final_portfolio = final_portfolio.reset_index(drop=True)
-
-    # write reports
-    csv_path, html_path = build_reports(final_portfolio, run_date)
-
-    # optionally send email
-    enable_email = str(safe_get(secrets, "ENABLE_EMAIL", cfg.get("email", {}).get("enabled", "false"))).lower() == "true"
-    smtp_user = safe_get(secrets, "EMAIL_SMTP_USER", cfg.get("email", {}).get("from_addr"))
-    smtp_pass = safe_get(secrets, "EMAIL_SMTP_PASS", safe_get(secrets, "GMAIL_APP_PASSWORD"))
-    to_addr = safe_get(secrets, "TO_EMAIL", cfg.get("email", {}).get("to_addr"))
-
-    if enable_email:
-        if not smtp_user or not smtp_pass or not to_addr:
-            logger.error("Email enabled but SMTP credentials or TO_EMAIL missing. SMTP_USER=%s TO_EMAIL=%s", bool(smtp_user), bool(to_addr))
-        else:
-            subject = f"Robo Advisor Report {run_date}"
-            body = f"Attached are the reports for {run_date}.\nCSV: {csv_path}\nHTML: {html_path}"
-            try:
-                send_email(smtp_user, smtp_pass, to_addr, subject, body, smtp_host=cfg.get("email", {}).get("smtp_host", "smtp.gmail.com"), smtp_port=cfg.get("email", {}).get("smtp_port", 587))
-            except Exception as e:
-                logger.exception("Email send failed: %s", e)
-    else:
-        logger.info("Email disabled by ENABLE_EMAIL flag or config.")
-
-    logger.info("Pipeline finished. Reports: %s, %s", csv_path, html_path)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
-    args = parser.parse_args()
-    run(args.config)
+    logger.error("All fundamental providers failed for %s", symbol)
+    return None
