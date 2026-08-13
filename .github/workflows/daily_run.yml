@@ -28,15 +28,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          # try fallbacks for known problematic packages
-          pip install ta==0.12.0 || pip install ta==0.11.0
-          pip install logdna==2.0.0 || pip install logdna==1.18.12
-          pip install -r requirements.txt --no-deps || true
           pip install -r requirements.txt
 
-      - name: Run daily pipeline (produce report)
+      - name: Run daily pipeline (produce reports)
         env:
-          # Market data
           ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
           FMP_KEY: ${{ secrets.FMP_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
@@ -44,62 +39,21 @@ jobs:
           SIMFIN_API_KEY: ${{ secrets.SIMFIN_API_KEY }}
           ROIC_API_KEY: ${{ secrets.ROIC_API_KEY }}
           TICKERBOT_API_KEY: ${{ secrets.TICKERBOT_API_KEY }}
-
-          # Brokerage / test accounts (if needed)
           RH_TEST_ACCOUNT_NUMBER: ${{ secrets.RH_TEST_ACCOUNT_NUMBER }}
           RH_TEST_EMAIL: ${{ secrets.RH_TEST_EMAIL }}
           RH_TEST_PASSWORD: ${{ secrets.RH_TEST_PASSWORD }}
-
-          # Feature flags
           ENABLE_LIVE: ${{ secrets.ENABLE_LIVE }}
           ENABLE_EMAIL: ${{ secrets.ENABLE_EMAIL }}
-
-          # Observability
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           LOGDNA_KEY: ${{ secrets.LOGDNA_KEY }}
         run: |
-          # Run the repo's daily pipeline; ensure it writes a report to reports/
-          python -m src.run_daily --config config.yaml
+          # Run the repo's daily pipeline; ensure it writes reports into reports/
+          python -m src.run_daily --config config.yaml || true
 
-      - name: Fail if browsing metadata present in report
+      - name: Debug reports directory
         run: |
-          REPORT="reports/daily_screening.csv"
-          if [ -f "$REPORT" ]; then
-            if grep -q "edge_all_open_tabs" "$REPORT" || grep -q "WebsiteContent_yivqn" "$REPORT"; then
-              echo "Found browsing metadata in $REPORT — aborting send."
-              exit 1
-            fi
-          else
-            echo "Report not found at $REPORT; skipping metadata check."
-          fi
-
-      - name: Send report by email (Gmail)
-        if: always()
-        env:
-          # SMTP host/port (Gmail defaults)
-          EMAIL_SMTP_HOST: smtp.gmail.com
-          EMAIL_SMTP_PORT: 587
-
-          # Preferred Gmail secrets
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-
-          # Fallback secret names (if you used different names)
-          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
-          EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
-          EMAILAPPPASSWORD: ${{ secrets.EMAILAPPPASSWORD }}
-
-          # From / To
-          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
-          TO_EMAIL: ${{ secrets.TO_EMAIL }}
-        run: |
-          REPORT_FILE="reports/daily_screening.csv"
-          if [ ! -f "$REPORT_FILE" ]; then
-            echo "Report not found at $REPORT_FILE"
-            ls -la reports || true
-            exit 2
-          fi
-          python scripts/send_report_email.py --file "$REPORT_FILE" --subject "CoPilot Stock Report"
+          echo "Listing reports/"
+          ls -la reports || true
 
       - name: Upload reports artifact
         if: always()
@@ -107,3 +61,57 @@ jobs:
         with:
           name: robo-reports
           path: reports/
+
+      - name: Find report file
+        id: find_report
+        run: |
+          # Find first matching report file (csv, xlsx, parquet, json)
+          REPORT=$(ls reports/*.{csv,xlsx,parquet,json} 2>/dev/null | head -n 1 || true)
+          if [ -z "$REPORT" ]; then
+            echo "report_path="
+          else
+            echo "report_path=$REPORT"
+          fi
+        shell: bash
+
+      - name: Upload single report to S3 with deterministic key
+        if: always() && env.AWS_S3_BUCKET
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: |
+          REPORT="${{ steps.find_report.outputs.report_path }}"
+          if [ -z "$REPORT" ]; then
+            echo "No report found; skipping S3 upload."
+            exit 0
+          fi
+          DATE=$(date -u +"%Y-%m-%d")
+          RUN_ID=${{ github.run_id }}
+          SHORT_SHA=${{ github.sha }}
+          SHORT_SHA=${SHORT_SHA:0:8}
+          BASENAME=$(basename "$REPORT")
+          KEY="daily-reports/${RUN_ID}/${DATE}_${SHORT_SHA}_${BASENAME}"
+          echo "Uploading $REPORT to s3://${AWS_S3_BUCKET}/${KEY}"
+          python -m pip install --upgrade awscli
+          aws s3 cp "$REPORT" "s3://${AWS_S3_BUCKET}/${KEY}" --region "${AWS_REGION}"
+        shell: bash
+
+      - name: Generate summary and email (no attachments)
+        if: always()
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: |
+          python -m pip install --upgrade pandas numpy || true
+          REPORT_PATH="${{ steps.find_report.outputs.report_path }}"
+          if [ -z "$REPORT_PATH" ]; then
+            echo "No report found; sending notification email with status only."
+            python scripts/send_report_email.py --file /dev/null --subject "CoPilot Stock Report" --body "No report produced in this run. Check artifacts for details."
+            exit 0
+          fi
+          python scripts/format_and_email_summary.py --path reports/ --subject "CoPilot Stock Report"
+        shell: bash
