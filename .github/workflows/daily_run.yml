@@ -17,25 +17,29 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Run daily pipeline
-        env:
-          ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
-          FMP_KEY: ${{ secrets.FMP_KEY }}
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          SimFin: ${{ secrets.SimFin }}
-          ROIC_API_KEY: ${{ secrets.ROIC_API_KEY }}
-          TICKERBOT_API_KEY: ${{ secrets.TICKERBOT_API_KEY }}
-          EmailAppPassword: ${{ secrets.EmailAppPassword }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
-          EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
-          RH_TEST_ACCOUNT_NUMBER: ${{ secrets.RH_TEST_ACCOUNT_NUMBER }}
-          RH_TEST_EMAIL: ${{ secrets.RH_TEST_EMAIL }}
-          RH_TEST_PASSWORD: ${{ secrets.RH_TEST_PASSWORD }}
-          TO_EMAIL: ${{ secrets.TO_EMAIL }}
-          ENABLE_LIVE: ${{ secrets.ENABLE_LIVE }}
-        run: |
-          python -m src.run_daily --config config.yaml
+  env:
+    EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
+    EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
+    GMAIL_USER: ${{ secrets.GMAIL_USER }}
+    GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+    TO_EMAIL: ${{ secrets.TO_EMAIL }}
+    ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
+    FMP_KEY: ${{ secrets.FMP_KEY }}
+    FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+    FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    SIMFIN_API_KEY: ${{ secrets.SIMFIN_API_KEY }}
+    ROIC_API_KEY: ${{ secrets.ROIC_API_KEY }}
+    TICKERBOT_API_KEY: ${{ secrets.TICKERBOT_API_KEY }}
+    RH_TEST_ACCOUNT_NUMBER: ${{ secrets.RH_TEST_ACCOUNT_NUMBER }}
+    RH_TEST_EMAIL: ${{ secrets.RH_TEST_EMAIL }}
+    RH_TEST_PASSWORD: ${{ secrets.RH_TEST_PASSWORD }}
+    ENABLE_LIVE: ${{ secrets.ENABLE_LIVE }}
+    ENABLE_EMAIL: ${{ secrets.ENABLE_EMAIL }}
+    SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+    LOGDNA_KEY: ${{ secrets.LOGDNA_KEY }}
+  run: |
+    python -m src.run_daily --config config.yaml
+
       - name: Upload reports
         uses: actions/upload-artifact@v4
         with:
