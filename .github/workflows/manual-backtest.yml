@@ -51,7 +51,7 @@ jobs:
           echo "Tickerbot base: $TICKERBOT_URL"
           echo "Requesting SPY daily price series (2005-01-01..2005-06-30) via /v2/series"
           curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
-            "$TICKERBOT_URL/v2/series?tickers=SPY&columns=price&interval=1d&start=2005-01-01&end=2005-06-30" | sed -n '1,200p' || true
+            "$TICKERBOT_URL/v2/series?tickers=SPY&columns=price&interval=1d&from=2005-01-01&to=2005-06-30" | sed -n '1,200p' || true
           echo
           echo "Requesting SPY snapshot as-of 2005-06-30 via /v2/tickers/{ticker}?asof="
           curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
@@ -78,6 +78,39 @@ jobs:
             --test-months "$TEST" \
             --out outputs/backtest \
             --source-mode "$SOURCE_MODE"
+
+      - name: Email backtest results
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Walk-Forward Backtest Results"
+          to: ${{ secrets.TO_EMAIL }}
+          from: "Backtest Bot <${{ secrets.SMTP_USERNAME }}>"
+          body: |
+            Hello Nidal,
+
+            Your walk-forward backtest has completed successfully.
+
+            Attached:
+            - Equity curve (strategy vs SPY/QQQ/VT)
+            - Fold-level returns
+            - Data quality heatmap
+            - Rolling Sharpe ratio
+            - CSV results
+            - JSON fold summary
+
+            Best,
+            Copilot Backtest Engine
+          attachments: |
+            outputs/backtest.equity.png
+            outputs/backtest.folds.png
+            outputs/backtest.quality.png
+            outputs/backtest.sharpe.png
+            outputs/backtest.csv
+            outputs/backtest.folds.json
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
