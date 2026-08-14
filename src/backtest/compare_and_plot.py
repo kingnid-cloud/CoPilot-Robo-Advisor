@@ -1,31 +1,28 @@
 from __future__ import annotations
 import argparse
 import json
-from pathlib import Path
+import os
 import logging
-import math
 import time
-from datetime import timedelta, datetime
+from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 import importlib
-from dateutil.relativedelta import relativedelta
+import requests
 import pandas_datareader.data as pdr
+from dateutil.relativedelta import relativedelta
+
 logger = logging.getLogger("compare_backtest")
 logging.basicConfig(level=logging.INFO)
 
 
 def make_folds(start: str, end: str, train_years: int, test_months: int):
-    """
-    Create a sequence of fold dicts with test_start/test_end between start and end.
-    Each fold's test period begins after the training window.
-    """
     s = pd.to_datetime(start)
     e = pd.to_datetime(end)
     folds = []
-
     current_train_start = s
     while True:
         test_start = current_train_start + relativedelta(years=train_years)
@@ -41,99 +38,217 @@ def make_folds(start: str, end: str, train_years: int, test_months: int):
 
 def compute_returns_for_fold(tickers, test_start: str, test_end: str):
     """
-    Robustly compute average return across tickers between test_start and test_end.
-    Tries in order:
-      1) yf.Ticker(...).history()
-      2) yf.download(...)
-      3) pandas_datareader (stooq) as a last resort
-    Returns a float return (e.g., 0.02 for +2%). Logs diagnostic details for each attempt.
+    Multi-source, robust return computation.
+    Tries in order per ticker:
+      1) yfinance Ticker.history()
+      2) yfinance.download()
+      3) pandas_datareader (stooq)
+      4) Tickerbot.io API (requires TICKERBOT_API_KEY secret)
+      5) AlphaVantage API (requires ALPHAVANTAGE_KEY secret)
+
+    Returns a float (arithmetic mean across tickers if tickers is a list).
     """
     max_attempts = 3
     end_plus1 = (pd.to_datetime(test_end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    tickerbot_key = os.environ.get("TICKERBOT_API_KEY", "").strip()
+    tickerbot_base = os.environ.get("TICKERBOT_URL", "https://api.tickerbot.io").strip().rstrip("/")
+    av_key = os.environ.get("ALPHAVANTAGE_KEY", "").strip()
 
-    def try_ticker_history(ticker):
-        tk = yf.Ticker(ticker)
-        hist = tk.history(start=test_start, end=end_plus1)
-        logger.info("history() for %s returned shape=%s", ticker, None if hist is None else getattr(hist, "shape", None))
-        return hist
-
-    def try_yf_download(ticker):
-        # yf.download sometimes returns data when Ticker.history doesn't
-        df = yf.download(ticker, start=test_start, end=end_plus1, progress=False, threads=False)
-        logger.info("yf.download for %s returned shape=%s", ticker, None if df is None else getattr(df, "shape", None))
-        return df
-
-    def try_pdr_stooq(ticker):
-        try:
-            df = pdr.DataReader(ticker, "stooq", start=test_start, end=end_plus1)
-            # stooq returns index in descending order; sort by index
-            if df is not None and not df.empty:
-                df = df.sort_index()
-            logger.info("pandas_datareader(stooq) for %s returned shape=%s", ticker, None if df is None else getattr(df, "shape", None))
-            return df
-        except Exception as exc:
-            logger.info("pandas_datareader(stooq) failed for %s: %s", ticker, exc)
-            return None
-
-    # helper to compute return from a dataframe that must include 'Close' or an equivalent column
-    def compute_from_df(df, ticker):
+    def compute_from_df(df):
         if df is None or df.empty:
-            return None
-        # select Close-like column
+            return None, 0
+        # Prefer 'Close' (case-insensitive)
         if "Close" in df:
             ser = df["Close"].dropna()
         elif "close" in df:
             ser = df["close"].dropna()
-        elif "Close**" in df:  # just in case of weird names
-            ser = df.iloc[:, -1].dropna()
         else:
-            # try last column
-            ser = df.iloc[:, df.shape[1] - 1].dropna() if df.shape[1] > 0 else pd.Series(dtype=float)
+            numeric_cols = df.select_dtypes(include="number").columns
+            if len(numeric_cols) == 0:
+                ser = pd.Series(dtype=float)
+            else:
+                ser = df[numeric_cols[-1]].dropna()
         if ser.empty:
-            return None
-        entry = ser.iloc[0]
-        exit = ser.iloc[-1]
-        return float((exit / entry) - 1.0)
+            return None, 0
+        entry = ser.iloc[0]; exit = ser.iloc[-1]
+        return float((exit / entry) - 1.0), len(ser)
 
-    # When tickers is a list, compute per-ticker and average; otherwise single ticker flow
+    def try_ticker_history(ticker):
+        try:
+            tk = yf.Ticker(ticker)
+            hist = tk.history(start=test_start, end=end_plus1)
+            logger.info("history() for %s returned shape=%s", ticker, None if hist is None else getattr(hist, "shape", None))
+            return hist
+        except Exception as exc:
+            logger.info("Ticker.history() error for %s: %s", ticker, exc)
+            return None
+
+    def try_yf_download(ticker):
+        try:
+            # some yfinance versions accept progress/threads, others don't; try with those and fall back
+            try:
+                df = yf.download(ticker, start=test_start, end=end_plus1, progress=False, threads=False)
+            except TypeError:
+                df = yf.download(ticker, start=test_start, end=end_plus1)
+            logger.info("yf.download for %s returned shape=%s", ticker, None if df is None else getattr(df, "shape", None))
+            return df
+        except Exception as exc:
+            logger.info("yf.download error for %s: %s", ticker, exc)
+            return None
+
+    def try_pdr_stooq(ticker):
+        # try both raw ticker and ticker + '.US' (stooq sometimes expects suffix)
+        for symbol in (ticker, f"{ticker}.US"):
+            try:
+                df = pdr.DataReader(symbol, "stooq", start=test_start, end=end_plus1)
+                if df is not None and not df.empty:
+                    df = df.sort_index()
+                logger.info("pandas_datareader(stooq) for %s returned shape=%s", symbol, None if df is None else getattr(df, "shape", None))
+                return df
+            except Exception as exc:
+                logger.info("pandas_datareader(stooq) failed for %s: %s", symbol, exc)
+        return None
+
+    def try_tickerbot(ticker):
+        if not tickerbot_base:
+            logger.info("Tickerbot base URL not set; skipping tickerbot for %s", ticker)
+            return None
+        url = f"{tickerbot_base}/v1/tickers/{ticker}/series"
+        params = {"start": test_start, "end": test_end, "granularity": "d"}
+        headers = {}
+        if tickerbot_key:
+            headers["Authorization"] = f"Bearer {tickerbot_key}"
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
+            resp.raise_for_status()
+            j = resp.json()
+            # try common keys
+            prices = None
+            for k in ("series", "data", "prices", "items"):
+                if k in j:
+                    prices = j[k]
+                    break
+            # fallback: if response is a mapping of date->values
+            if prices is None and isinstance(j, dict):
+                # detect date-like keys
+                date_keys = [k for k in j.keys() if isinstance(k, str) and k.count("-") == 2]
+                if date_keys:
+                    prices = [{"date": k, **(j[k] if isinstance(j[k], dict) else {"close": j[k]})} for k in date_keys]
+            if not prices:
+                logger.info("Tickerbot returned no prices for %s (keys=%s)", ticker, list(j.keys())[:6])
+                return None
+            df = pd.DataFrame(prices)
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.set_index("date").sort_index()
+            if "close" in df.columns and "Close" not in df.columns:
+                df = df.rename(columns={"close": "Close"})
+            if "Close" in df.columns:
+                df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+            logger.info("Tickerbot for %s returned shape=%s", ticker, getattr(df, "shape", None))
+            return df
+        except Exception as exc:
+            logger.info("Tickerbot request failed for %s: %s", ticker, exc)
+            return None
+
+    def try_alpha_vantage(ticker):
+        if not av_key:
+            logger.info("AlphaVantage key not set; skipping AlphaVantage for %s", ticker)
+            return None
+        url = "https://www.alphavantage.co/query"
+        params = {"function": "TIME_SERIES_DAILY_ADJUSTED", "symbol": ticker, "outputsize": "full", "apikey": av_key}
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            j = resp.json()
+            ts_key = None
+            # AlphaVantage returns "Time Series (Daily)"
+            if "Time Series (Daily)" in j:
+                ts_key = "Time Series (Daily)"
+            if ts_key is None:
+                logger.info("AlphaVantage returned no time series for %s: keys=%s", ticker, list(j.keys())[:6])
+                return None
+            data = j[ts_key]
+            df = pd.DataFrame.from_dict(data, orient="index")
+            df.index = pd.to_datetime(df.index)
+            df = df.sort_index()
+            # normalized 'Close'
+            if "5. adjusted close" in df.columns:
+                df = df.rename(columns={"5. adjusted close": "Close"})
+                df["Close"] = df["Close"].astype(float)
+            elif "4. close" in df.columns:
+                df = df.rename(columns={"4. close": "Close"})
+                df["Close"] = df["Close"].astype(float)
+            else:
+                numeric_cols = df.select_dtypes(include="number").columns
+                if len(numeric_cols) > 0:
+                    df = df.rename(columns={numeric_cols[-1]: "Close"})
+                else:
+                    return None
+            # filter date range
+            df = df[(df.index >= pd.to_datetime(test_start)) & (df.index <= pd.to_datetime(test_end))]
+            logger.info("AlphaVantage for %s returned shape=%s", ticker, getattr(df, "shape", None))
+            return df
+        except Exception as exc:
+            logger.info("AlphaVantage request failed for %s: %s", ticker, exc)
+            return None
+
+    methods = [
+        ("history", try_ticker_history),
+        ("download", try_yf_download),
+        ("stooq", try_pdr_stooq),
+        ("tickerbot", try_tickerbot),
+        ("alphavantage", try_alpha_vantage),
+    ]
+
     for attempt in range(1, max_attempts + 1):
         try:
             if isinstance(tickers, (list, tuple)) and len(tickers) > 1:
                 rets = []
                 for t in tickers:
-                    # try methods in order
-                    for method, fn in (("history", try_ticker_history), ("download", try_yf_download), ("stooq", try_pdr_stooq)):
+                    best_ret = None
+                    best_len = -1
+                    for name, fn in methods:
+                        df = None
                         try:
                             df = fn(t)
                         except Exception as exc:
-                            logger.warning("Method %s raised for %s (attempt %d): %s", method, t, attempt, exc)
-                            df = None
-                        r = compute_from_df(df, t)
-                        if r is not None:
-                            logger.info("Method %s succeeded for %s: return=%0.6f", method, t, r)
-                            rets.append(r)
-                            break
+                            logger.info("Method %s raised for %s (attempt %d): %s", name, t, attempt, exc)
+                        r, n = compute_from_df(df)
+                        if r is not None and n > best_len:
+                            best_ret = r
+                            best_len = n
+                            logger.info("Method %s selected for %s: return=%0.6f (n=%d)", name, t, r, n)
                         else:
-                            logger.info("Method %s returned no usable data for %s (attempt %d)", method, t, attempt)
-                    # continue to next ticker
+                            logger.info("Method %s produced no usable data (n=%d) for %s (attempt %d)", name, n, t, attempt)
+                    if best_ret is not None:
+                        rets.append(best_ret)
+                    else:
+                        logger.warning("No valid data found for ticker %s across methods (attempt %d)", t, attempt)
                 if not rets:
                     raise RuntimeError("no valid ticker returns found across methods")
                 return float(sum(rets) / len(rets))
             else:
                 t = tickers[0] if isinstance(tickers, (list, tuple)) else tickers
-                for method, fn in (("history", try_ticker_history), ("download", try_yf_download), ("stooq", try_pdr_stooq)):
+                best_ret = None
+                best_len = -1
+                for name, fn in methods:
+                    df = None
                     try:
                         df = fn(t)
                     except Exception as exc:
-                        logger.warning("Method %s raised for %s (attempt %d): %s", method, t, attempt, exc)
-                        df = None
-                    r = compute_from_df(df, t)
-                    if r is not None:
-                        logger.info("Method %s succeeded for %s: return=%0.6f", method, t, r)
-                        return r
+                        logger.info("Method %s raised for %s (attempt %d): %s", name, t, attempt, exc)
+                    r, n = compute_from_df(df)
+                    if r is not None and n > best_len:
+                        best_ret = r
+                        best_len = n
+                        logger.info("Method %s selected for %s: return=%0.6f (n=%d)", name, t, r, n)
                     else:
-                        logger.info("Method %s returned no usable data for %s (attempt %d)", method, t, attempt)
-                raise RuntimeError(f"No data for ticker {t}")
+                        logger.info("Method %s produced no usable data (n=%d) for %s (attempt %d)", name, n, t, attempt)
+                if best_ret is not None:
+                    return best_ret
+                else:
+                    raise RuntimeError(f"No data for ticker {t}")
         except Exception as exc:
             logger.warning("Attempt %d: Failed to compute returns for %s (%s-%s): %s", attempt, tickers, test_start, test_end, exc)
             if attempt < max_attempts:
@@ -146,10 +261,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
 
 
 def get_summary_with_adapters(tickers, start, end, train_years, test_months, fred_key=None):
-    """
-    Try to call an existing walkforward runner if available in src.backtest.walkforward.
-    If not present or not usable, create a simple fold-based summary using yfinance.
-    """
     try:
         wf_mod = importlib.import_module("src.backtest.walkforward")
         for name in ("run_walk_forward", "run_walkforward", "run", "execute", "walk_forward"):
@@ -226,8 +337,20 @@ def compare_and_plot(tickers, start, end, train_years, test_months, fred_key=Non
         strat_r = f.get("strategy_return")
         if strat_r is None:
             strat_r = 0.0
+        # compute SPY return over same period using available sources (prefer yf.download - it's okay if earlier methods fail)
         try:
-            spy_df = yf.download("SPY", start=ts, end=(pd.to_datetime(te) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), progress=False, threads=False)
+            spy_df = None
+            # try yf.download first (more likely to have standard Close column)
+            try:
+                spy_df = yf.download("SPY", start=ts, end=(pd.to_datetime(te) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), progress=False, threads=False)
+            except TypeError:
+                spy_df = yf.download("SPY", start=ts, end=(pd.to_datetime(te) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
+            if spy_df is None or spy_df.empty or "Close" not in spy_df:
+                # fallback to Ticker.history
+                try:
+                    spy_df = yf.Ticker("SPY").history(start=ts, end=(pd.to_datetime(te) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
+                except Exception:
+                    spy_df = None
             if spy_df is None or spy_df.empty:
                 spy_r = 0.0
             else:
