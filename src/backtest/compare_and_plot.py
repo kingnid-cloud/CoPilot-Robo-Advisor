@@ -128,25 +128,16 @@ def _parse_prices_from_json(j: object):
 
 # ---------- data sources ----------
 
-def _tickerbot_series(
-    ticker: str,
-    start: str,
-    end: str,
-    debug_dir: Path,
-) -> pd.DataFrame | None:
+def _tickerbot_series(ticker: str, start: str, end: str, debug_dir: Path) -> pd.DataFrame | None:
     """
-    Primary source: Tickerbot /v2/series — aligned grid of prices over time.
-    Uses correct parameters: from=, to=
+    Correct parser for Tickerbot /v2/series using from= and to=
     """
-    base = os.environ.get("TICKERBOT_URL", "https://api.tickerbot.io").strip().rstrip("/")
-    key = os.environ.get("TICKERBOT_API_KEY", "").strip()
+    base = os.environ.get("TICKERBOT_URL", "").rstrip("/")
+    key = os.environ.get("TICKERBOT_API_KEY", "")
     if not base:
-        logger.info("Tickerbot base URL not set; skipping /v2/series for %s", ticker)
         return None
 
-    headers = {}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
 
     url = f"{base}/v2/series"
     params = {
@@ -159,48 +150,38 @@ def _tickerbot_series(
 
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=30)
-        _save_debug_bytes(
-            debug_dir / f"tickerbot_raw_series_{ticker}_{start}_{end}.json",
-            resp.content,
-        )
-        logger.info("Tickerbot /v2/series %s status=%s", url, resp.status_code)
+        _save_debug_bytes(debug_dir / f"series_raw_{ticker}_{start}_{end}.json", resp.content)
+
         if resp.status_code != 200:
             return None
 
         j = resp.json()
-        prices = _parse_prices_from_json(j)
-        if prices is None:
+
+        # Correct structure:
+        # j["data"][ticker] = [ [date, price], [date, price], ... ]
+        if "data" not in j or ticker not in j["data"]:
             return None
 
-        if isinstance(prices, dict):
-            prices = [
-                {
-                    "date": k,
-                    **(
-                        prices[k]
-                        if isinstance(prices[k], dict)
-                        else {"close": prices[k]}
-                    ),
-                }
-                for k in prices.keys()
-            ]
+        rows = j["data"][ticker]
+        parsed = []
+        for row in rows:
+            date_str, price_val = row
+            parsed.append({"date": date_str, "Close": price_val})
 
-        df = pd.DataFrame(prices)
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index("date").sort_index()
+        df = pd.DataFrame(parsed)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df = df.set_index("date").sort_index()
 
-        if "price" in df.columns and "Close" not in df.columns:
-            df = df.rename(columns={"price": "Close"})
-        if "close" in df.columns and "Close" not in df.columns:
-            df = df.rename(columns={"close": "Close"})
         df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        df = df.dropna(subset=["Close"])
 
         return df
 
     except Exception as exc:
-        logger.info("Tickerbot /v2/series request failed for %s: %s", ticker, exc)
+        logger.info("Tickerbot /v2/series parse failed for %s: %s", ticker, exc)
         return None
+
 
 
 def _tickerbot_snapshot_series(
