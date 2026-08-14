@@ -4,11 +4,12 @@ import argparse
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from datetime import datetime
 
-import time
 import importlib
+import concurrent.futures
 
 import pandas as pd
 import yfinance as yf
@@ -18,6 +19,8 @@ from dateutil.relativedelta import relativedelta
 logger = logging.getLogger("compare_backtest")
 logging.basicConfig(level=logging.INFO)
 
+
+# ---------- fold construction ----------
 
 def make_folds(start: str, end: str, train_years: int, test_months: int):
     s = pd.to_datetime(start)
@@ -41,6 +44,8 @@ def make_folds(start: str, end: str, train_years: int, test_months: int):
     return folds
 
 
+# ---------- helpers ----------
+
 def _save_debug_bytes(path: Path, b: bytes):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,7 +61,6 @@ def _compute_from_df(df: pd.DataFrame | None):
     if df is None or df.empty:
         return None, 0
 
-    # Normalize possible column names
     if "Close" not in df and "price" in df:
         df = df.rename(columns={"price": "Close"})
     if "Close" not in df and "close" in df:
@@ -79,7 +83,8 @@ def _compute_from_df(df: pd.DataFrame | None):
     if entry < 1e-6 or entry < med * 1e-4:
         return None, 0
 
-    return float((exit_ / entry) - 1.0), len(closes)
+    ret = float((exit_ / entry) - 1.0)
+    return ret, len(closes)
 
 
 def _parse_prices_from_json(j: object):
@@ -120,6 +125,8 @@ def _parse_prices_from_json(j: object):
                 pass
     return None
 
+
+# ---------- data sources ----------
 
 def _tickerbot_series(
     ticker: str,
@@ -201,25 +208,6 @@ def _tickerbot_series(
             df = df.rename(columns={"close": "Close"})
         if "Close" in df.columns:
             df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-
-        try:
-            parsed_debug = {
-                "source": "series",
-                "parsed_shape": getattr(df, "shape", None),
-                "columns": list(df.columns),
-            }
-            if "Close" in df:
-                desc = df["Close"].describe().to_dict()
-                parsed_debug["close_describe"] = {
-                    k: (float(v) if pd.notna(v) else None)
-                    for k, v in desc.items()
-                }
-            (debug_dir / f"tickerbot_parsed_series_{ticker}_{start}_{end}.json").write_text(
-                json.dumps(parsed_debug),
-                encoding="utf-8",
-            )
-        except Exception:
-            logger.exception("Failed to write parsed debug for tickerbot /v2/series")
 
         return df
     except Exception as exc:
@@ -309,30 +297,61 @@ def _tickerbot_snapshot_series(
     if "Close" in df.columns:
         df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
 
-    try:
-        parsed_debug = {
-            "source": "snapshot_series",
-            "parsed_shape": getattr(df, "shape", None),
-            "sample_rows": rows[:3],
-        }
-        (debug_dir / f"tickerbot_parsed_snapshotseries_{ticker}_{start}_{end}.json").write_text(
-            json.dumps(parsed_debug),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-
-    logger.info(
-        "Built snapshot-based series for %s with %d rows",
-        ticker,
-        getattr(df, "shape", None)[0] if getattr(df, "shape", None) else 0,
-    )
     return df
 
 
-def _yf_download_series(ticker: str, start: str, end: str, debug_dir: Path) -> pd.DataFrame | None:
+def _fmp_series(
+    ticker: str,
+    start: str,
+    end: str,
+    debug_dir: Path,
+) -> pd.DataFrame | None:
     """
-    Secondary fallback: yfinance daily prices.
+    Fallback: FinancialModelingPrep historical-price-full.
+    """
+    key = os.environ.get("FMP_KEY", "").strip()
+    if not key:
+        logger.info("FMP_KEY not set; skipping FMP for %s", ticker)
+        return None
+
+    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}"
+    params = {"from": start, "to": end, "apikey": key}
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        _save_debug_bytes(
+            debug_dir / f"fmp_raw_{ticker}_{start}_{end}.json",
+            resp.content,
+        )
+        if resp.status_code != 200:
+            logger.info("FMP returned status %s for %s", resp.status_code, url)
+            return None
+        j = resp.json()
+        if "historical" not in j or not isinstance(j["historical"], list):
+            logger.info("FMP returned no historical data for %s", ticker)
+            return None
+        rows = j["historical"]
+        df = pd.DataFrame(rows)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()
+        if "close" in df.columns and "Close" not in df.columns:
+            df = df.rename(columns={"close": "Close"})
+        if "Close" in df.columns:
+            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        return df
+    except Exception as exc:
+        logger.info("FMP request failed for %s: %s", ticker, exc)
+        return None
+
+
+def _yf_download_series(
+    ticker: str,
+    start: str,
+    end: str,
+    debug_dir: Path,
+) -> pd.DataFrame | None:
+    """
+    Tertiary fallback: yfinance daily prices.
     """
     end_plus1 = (pd.to_datetime(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     try:
@@ -370,136 +389,149 @@ def _yf_download_series(ticker: str, start: str, end: str, debug_dir: Path) -> p
         return None
 
 
-def compute_returns_for_fold(tickers, test_start: str, test_end: str) -> float:
-    """
-    Robust return computation for one fold.
+# ---------- caching + unified fetch ----------
 
-    Order of preference:
-      1. Tickerbot /v2/series (daily price grid)
-      2. Tickerbot snapshot-per-day series via /v2/tickers/{ticker}?asof=
-      3. yfinance daily prices
+def _cache_path(ticker: str, start: str, end: str) -> Path:
+    cache_dir = Path("outputs/cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{ticker}_{start}_{end}.parquet"
+
+
+def _load_cache(ticker: str, start: str, end: str) -> pd.DataFrame | None:
+    path = _cache_path(ticker, start, end)
+    if path.exists():
+        try:
+            df = pd.read_parquet(path)
+            return df
+        except Exception:
+            return None
+    return None
+
+
+def _save_cache(ticker: str, start: str, end: str, df: pd.DataFrame):
+    path = _cache_path(ticker, start, end)
+    try:
+        df.to_parquet(path)
+    except Exception:
+        pass
+
+
+def get_price_series(
+    ticker: str,
+    start: str,
+    end: str,
+    source_mode: str,
+    debug_dir: Path,
+) -> pd.DataFrame | None:
+    """
+    Unified fetch with caching and source selection.
+
+    source_mode:
+      - 'auto'       : series -> snapshot -> FMP -> yfinance
+      - 'tickerbot'  : series only
+      - 'snapshot'   : snapshot only
+      - 'fmp'        : FMP only
+      - 'yf'         : yfinance only
+    """
+    cached = _load_cache(ticker, start, end)
+    if cached is not None and not cached.empty:
+        return cached
+
+    methods_auto = [
+        ("tickerbot_series", _tickerbot_series),
+        ("tickerbot_snapshot", _tickerbot_snapshot_series),
+        ("fmp", _fmp_series),
+        ("yf_download", _yf_download_series),
+    ]
+
+    if source_mode == "tickerbot":
+        methods = [("tickerbot_series", _tickerbot_series)]
+    elif source_mode == "snapshot":
+        methods = [("tickerbot_snapshot", _tickerbot_snapshot_series)]
+    elif source_mode == "fmp":
+        methods = [("fmp", _fmp_series)]
+    elif source_mode == "yf":
+        methods = [("yf_download", _yf_download_series)]
+    else:
+        methods = methods_auto
+
+    df_best = None
+    best_len = -1
+
+    for name, fn in methods:
+        try:
+            df = fn(ticker, start, end, debug_dir)
+        except Exception as exc:
+            logger.info("Source %s raised for %s: %s", name, ticker, exc)
+            df = None
+        r, n = _compute_from_df(df)
+        if r is not None and n > best_len:
+            df_best = df
+            best_len = n
+            logger.info("Source %s selected for %s (n=%d, ret=%0.6f)", name, ticker, n, r)
+        else:
+            logger.info("Source %s produced no usable data (n=%d) for %s", name, n, ticker)
+
+    if df_best is not None and not df_best.empty:
+        _save_cache(ticker, start, end, df_best)
+        return df_best
+
+    return None
+
+
+# ---------- fold return computation ----------
+
+def compute_returns_for_fold(
+    tickers,
+    test_start: str,
+    test_end: str,
+    source_mode: str,
+    min_days: int = 30,
+) -> dict:
+    """
+    Compute strategy return and data quality for one fold.
     """
     debug_dir = Path("outputs/debug")
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    methods = [
-        ("tickerbot_series", _tickerbot_series),
-        ("tickerbot_snapshot", _tickerbot_snapshot_series),
-        ("yf_download", _yf_download_series),
-    ]
+    if isinstance(tickers, (list, tuple)) and len(tickers) > 1:
+        rets = []
+        days_list = []
+        for t in tickers:
+            df = get_price_series(t, test_start, test_end, source_mode, debug_dir)
+            r, n = _compute_from_df(df)
+            if r is not None and n >= min_days:
+                rets.append(r)
+                days_list.append(n)
+        if not rets:
+            return {"return": 0.0, "days": 0, "missing": 0, "source": "none"}
+        avg_ret = float(sum(rets) / len(rets))
+        avg_days = int(sum(days_list) / len(days_list))
+        expected_days = (pd.to_datetime(test_end) - pd.to_datetime(test_start)).days + 1
+        missing = max(0, expected_days - avg_days)
+        return {
+            "return": avg_ret,
+            "days": avg_days,
+            "missing": missing,
+            "source": source_mode,
+        }
+    else:
+        t = tickers[0] if isinstance(tickers, (list, tuple)) else tickers
+        df = get_price_series(t, test_start, test_end, source_mode, debug_dir)
+        r, n = _compute_from_df(df)
+        if r is None or n < min_days:
+            return {"return": 0.0, "days": n or 0, "missing": 0, "source": source_mode}
+        expected_days = (pd.to_datetime(test_end) - pd.to_datetime(test_start)).days + 1
+        missing = max(0, expected_days - n)
+        return {
+            "return": r,
+            "days": n,
+            "missing": missing,
+            "source": source_mode,
+        }
 
-    max_attempts = 3
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            if isinstance(tickers, (list, tuple)) and len(tickers) > 1:
-                rets = []
-                for t in tickers:
-                    best_ret = None
-                    best_len = -1
-                    for name, fn in methods:
-                        df = None
-                        try:
-                            df = fn(t, test_start, test_end, debug_dir)
-                        except Exception as exc:
-                            logger.info(
-                                "Method %s raised for %s (attempt %d): %s",
-                                name,
-                                t,
-                                attempt,
-                                exc,
-                            )
-                        r, n = _compute_from_df(df)
-                        if r is not None and n > best_len:
-                            best_ret = r
-                            best_len = n
-                            logger.info(
-                                "Method %s selected for %s: return=%0.6f (n=%d)",
-                                name,
-                                t,
-                                r,
-                                n,
-                            )
-                        else:
-                            logger.info(
-                                "Method %s produced no usable data (n=%d) for %s (attempt %d)",
-                                name,
-                                n,
-                                t,
-                                attempt,
-                            )
-                    if best_ret is not None:
-                        rets.append(best_ret)
-                    else:
-                        logger.warning(
-                            "No valid data found for ticker %s across methods (attempt %d)",
-                            t,
-                            attempt,
-                        )
-                if not rets:
-                    raise RuntimeError("no valid ticker returns found across methods")
-                return float(sum(rets) / len(rets))
-            else:
-                t = tickers[0] if isinstance(tickers, (list, tuple)) else tickers
-                best_ret = None
-                best_len = -1
-                for name, fn in methods:
-                    df = None
-                    try:
-                        df = fn(t, test_start, test_end, debug_dir)
-                    except Exception as exc:
-                        logger.info(
-                            "Method %s raised for %s (attempt %d): %s",
-                            name,
-                            t,
-                            attempt,
-                            exc,
-                        )
-                    r, n = _compute_from_df(df)
-                    if r is not None and n > best_len:
-                        best_ret = r
-                        best_len = n
-                        logger.info(
-                            "Method %s selected for %s: return=%0.6f (n=%d)",
-                            name,
-                            t,
-                            r,
-                            n,
-                        )
-                    else:
-                        logger.info(
-                            "Method %s produced no usable data (n=%d) for %s (attempt %d)",
-                            name,
-                            n,
-                            t,
-                            attempt,
-                        )
-                if best_ret is not None:
-                    return best_ret
-                else:
-                    raise RuntimeError(f"No data for ticker {t}")
-        except Exception as exc:
-            logger.warning(
-                "Attempt %d: Failed to compute returns for %s (%s-%s): %s",
-                attempt,
-                tickers,
-                test_start,
-                test_end,
-                exc,
-            )
-            if attempt < max_attempts:
-                sleep_s = 2 ** attempt
-                logger.info("Sleeping %d seconds before retry...", sleep_s)
-                time.sleep(sleep_s)
-            else:
-                logger.error(
-                    "All attempts failed for %s (%s-%s); returning 0.0",
-                    tickers,
-                    test_start,
-                    test_end,
-                )
-                return 0.0
-
+# ---------- walkforward adapter ----------
 
 def get_summary_with_adapters(
     tickers,
@@ -508,6 +540,9 @@ def get_summary_with_adapters(
     train_years: int,
     test_months: int,
     fred_key: str | None = None,
+    source_mode: str = "auto",
+    min_days: int = 30,
+    parallel_workers: int = 4,
 ):
     """
     Adapter around src.backtest.walkforward if present; otherwise use builtin simple WF.
@@ -568,13 +603,22 @@ def get_summary_with_adapters(
                     logger.info("Using simple_report fallback on WalkForwardBacktester")
                     folds = make_folds(start, end, train_years, test_months)
                     rows = []
-                    for f in folds:
-                        r = compute_returns_for_fold(
-                            tickers,
-                            f["test_start"],
-                            f["test_end"],
-                        )
-                        rows.append({"combined": r})
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as ex:
+                        futures = {
+                            ex.submit(
+                                compute_returns_for_fold,
+                                tickers,
+                                f["test_start"],
+                                f["test_end"],
+                                source_mode,
+                                min_days,
+                            ): i
+                            for i, f in enumerate(folds)
+                        }
+                        for fut in concurrent.futures.as_completed(futures):
+                            i = futures[fut]
+                            res = fut.result()
+                            rows.append({"combined": res["return"]})
                     portfolio_df = pd.DataFrame(rows)
                     rep = instance.simple_report(portfolio_df)
                     out_folds = []
@@ -595,21 +639,39 @@ def get_summary_with_adapters(
 
     folds = make_folds(start, end, train_years, test_months)
     out_folds = []
-    for f in folds:
-        strat_r = compute_returns_for_fold(
-            tickers,
-            f["test_start"],
-            f["test_end"],
-        )
-        out_folds.append(
-            {
-                "test_start": f["test_start"],
-                "test_end": f["test_end"],
-                "strategy_return": strat_r,
-            }
-        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as ex:
+        futures = {
+            ex.submit(
+                compute_returns_for_fold,
+                tickers,
+                f["test_start"],
+                f["test_end"],
+                source_mode,
+                min_days,
+            ): i
+            for i, f in enumerate(folds)
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            i = futures[fut]
+            res = fut.result()
+            f = folds[i]
+            out_folds.append(
+                {
+                    "test_start": f["test_start"],
+                    "test_end": f["test_end"],
+                    "strategy_return": res["return"],
+                    "days": res["days"],
+                    "missing": res["missing"],
+                    "source": res["source"],
+                }
+            )
+
+    out_folds = sorted(out_folds, key=lambda x: x["test_end"])
     return {"folds": out_folds}
 
+
+# ---------- compare + plot ----------
 
 def compare_and_plot(
     tickers,
@@ -619,9 +681,12 @@ def compare_and_plot(
     test_months: int,
     fred_key: str | None = None,
     out_prefix: Path | str = Path("outputs/backtest"),
+    source_mode: str = "auto",
+    min_days: int = 30,
+    parallel_workers: int = 4,
 ):
     """
-    Run walk-forward backtest, compare vs SPY, and save CSV + PNG.
+    Run walk-forward backtest, compare vs SPY/QQQ/VT, and save CSV + PNG + JSON.
     """
     out_prefix = Path(out_prefix)
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -633,77 +698,180 @@ def compare_and_plot(
         train_years,
         test_months,
         fred_key=fred_key,
+        source_mode=source_mode,
+        min_days=min_days,
+        parallel_workers=parallel_workers,
     )
     folds = summary.get("folds", [])
 
+    debug_dir = Path("outputs/debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    # prefetch benchmarks once
+    benchmarks = ["SPY", "QQQ", "VT"]
+    bench_series = {}
+    for b in benchmarks:
+        dfb = get_price_series(b, start, end, source_mode, debug_dir)
+        if dfb is not None and not dfb.empty:
+            bench_series[b] = dfb["Close"].dropna()
+
     dates = []
     strat_vals = []
-    spy_vals = []
+    bench_vals = {b: [] for b in benchmarks}
     cum_strat = 1.0
-    cum_spy = 1.0
+    cum_bench = {b: 1.0 for b in benchmarks}
+
+    fold_summaries = []
 
     for f in folds:
         ts = f.get("test_start")
         te = f.get("test_end")
-        strat_r = f.get("strategy_return")
-        if strat_r is None:
-            strat_r = 0.0
+        strat_r = f.get("strategy_return", 0.0)
+        days = f.get("days", None)
+        missing = f.get("missing", None)
+        source_used = f.get("source", source_mode)
 
-        # SPY benchmark over same period — prefer Tickerbot, fallback to yfinance
-        spy_r = 0.0
-        try:
-            debug_dir = Path("outputs/debug")
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            spy_df = _tickerbot_series("SPY", ts, te, debug_dir)
-            if spy_df is None or spy_df.empty:
-                spy_df = _tickerbot_snapshot_series("SPY", ts, te, debug_dir)
-            if spy_df is None or spy_df.empty:
-                spy_df = _yf_download_series("SPY", ts, te, debug_dir)
-
-            if spy_df is not None and not spy_df.empty:
-                close = spy_df["Close"].dropna()
-                if not close.empty:
-                    spy_entry = close.iloc[0]
-                    spy_exit = close.iloc[-1]
-                    spy_r = (spy_exit / spy_entry) - 1.0
-        except Exception:
-            spy_r = 0.0
+        # benchmark returns per fold
+        bench_ret = {}
+        for b in benchmarks:
+            br = 0.0
+            try:
+                if b in bench_series:
+                    s = bench_series[b]
+                    mask = (s.index >= pd.to_datetime(ts)) & (s.index <= pd.to_datetime(te))
+                    sub = s[mask]
+                    if not sub.empty:
+                        entry = sub.iloc[0]
+                        exit_ = sub.iloc[-1]
+                        br = (exit_ / entry) - 1.0
+            except Exception:
+                br = 0.0
+            bench_ret[b] = br
 
         cum_strat *= (1.0 + strat_r)
-        cum_spy *= (1.0 + spy_r)
+        for b in benchmarks:
+            cum_bench[b] *= (1.0 + bench_ret[b])
+
         dates.append(pd.to_datetime(te))
         strat_vals.append(cum_strat)
-        spy_vals.append(cum_spy)
+        for b in benchmarks:
+            bench_vals[b].append(cum_bench[b])
+
+        fold_summaries.append(
+            {
+                "test_start": ts,
+                "test_end": te,
+                "strategy_return": strat_r,
+                "cum_strategy": cum_strat,
+                "bench_returns": bench_ret,
+                "cum_benchmarks": {b: cum_bench[b] for b in benchmarks},
+                "days": days,
+                "missing": missing,
+                "source": source_used,
+            }
+        )
 
     df = pd.DataFrame(
         {
             "date": dates,
             "strategy_cum": strat_vals,
-            "spy_cum": spy_vals,
+            **{f"{b.lower()}_cum": bench_vals[b] for b in benchmarks},
         }
     )
     df.to_csv(out_prefix.with_suffix(".csv"), index=False)
 
+    # fold summary JSON
+    folds_json_path = out_prefix.with_suffix(".folds.json")
+    try:
+        folds_json_path.write_text(json.dumps(fold_summaries, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to write fold summary JSON: %s", exc)
+
+    # plots: equity curves, fold bars, heatmap, rolling Sharpe
     try:
         import matplotlib.pyplot as plt
+        import numpy as np
 
+        # equity curves
         plt.figure(figsize=(10, 6))
         plt.plot(df["date"], df["strategy_cum"], label="Strategy", linewidth=2)
-        plt.plot(df["date"], df["spy_cum"], label="SPY", linewidth=2)
+        for b in benchmarks:
+            plt.plot(df["date"], df[f"{b.lower()}_cum"], label=b, linewidth=2)
         plt.xlabel("Date")
         plt.ylabel("Cumulative value (start = 1.0)")
-        plt.title("Walk-forward backtest vs SPY")
+        plt.title("Walk-forward backtest vs SPY / QQQ / VT")
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(out_prefix.with_suffix(".png"))
+        plt.savefig(out_prefix.with_suffix(".equity.png"))
         plt.close()
+
+        # fold returns bar chart
+        fold_dates = [pd.to_datetime(f["test_end"]) for f in fold_summaries]
+        fold_rets = [f["strategy_return"] for f in fold_summaries]
+        plt.figure(figsize=(10, 4))
+        plt.bar(fold_dates, fold_rets, width=10)
+        plt.axhline(0.0, color="black", linewidth=1)
+        plt.xlabel("Fold end date")
+        plt.ylabel("Fold return")
+        plt.title("Fold-level strategy returns")
+        plt.tight_layout()
+        plt.savefig(out_prefix.with_suffix(".folds.png"))
+        plt.close()
+
+        # data quality heatmap (days vs missing)
+        days_arr = np.array([f["days"] or 0 for f in fold_summaries])
+        missing_arr = np.array([f["missing"] or 0 for f in fold_summaries])
+        quality = np.clip(days_arr / (days_arr + missing_arr + 1e-9), 0.0, 1.0)
+        plt.figure(figsize=(10, 2))
+        plt.imshow(
+            quality.reshape(1, -1),
+            aspect="auto",
+            cmap="viridis",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        plt.colorbar(label="Data quality (1 = full)")
+        plt.xticks(
+            range(len(fold_dates)),
+            [d.strftime("%Y-%m") for d in fold_dates],
+            rotation=90,
+        )
+        plt.yticks([])
+        plt.title("Fold data quality heatmap")
+        plt.tight_layout()
+        plt.savefig(out_prefix.with_suffix(".quality.png"))
+        plt.close()
+
+        # rolling Sharpe over folds (using fold returns)
+        rets = np.array(fold_rets)
+        window = max(3, min(12, len(rets)))
+        roll_sharpe = []
+        for i in range(len(rets)):
+            if i + 1 < window:
+                roll_sharpe.append(np.nan)
+            else:
+                rwin = rets[i + 1 - window : i + 1]
+                mu = np.mean(rwin)
+                sigma = np.std(rwin)
+                roll_sharpe.append(mu / sigma if sigma > 1e-9 else np.nan)
+        plt.figure(figsize=(10, 4))
+        plt.plot(fold_dates, roll_sharpe, label=f"Rolling Sharpe (window={window})")
+        plt.axhline(0.0, color="black", linewidth=1)
+        plt.xlabel("Fold end date")
+        plt.ylabel("Sharpe (approx)")
+        plt.title("Rolling Sharpe across folds")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(out_prefix.with_suffix(".sharpe.png"))
+        plt.close()
+
     except Exception as exc:
         logger.warning("Failed to plot backtest results: %s", exc)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare walk-forward backtest vs SPY")
+    parser = argparse.ArgumentParser(description="Compare walk-forward backtest vs SPY/QQQ/VT")
     parser.add_argument(
         "--tickers",
         nargs="+",
@@ -736,6 +904,25 @@ def main():
         default=None,
         help="Optional FRED API key",
     )
+    parser.add_argument(
+        "--source-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "tickerbot", "snapshot", "fmp", "yf"],
+        help="Data source preference (auto/tickerbot/snapshot/fmp/yf)",
+    )
+    parser.add_argument(
+        "--min-days",
+        type=int,
+        default=30,
+        help="Minimum days of data required per fold",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Parallel workers for fold computation",
+    )
 
     args = parser.parse_args()
     compare_and_plot(
@@ -746,6 +933,9 @@ def main():
         test_months=args.test_months,
         fred_key=args.fred_key,
         out_prefix=Path(args.out),
+        source_mode=args.source_mode,
+        min_days=args.min_days,
+        parallel_workers=args.workers,
     )
 
 
