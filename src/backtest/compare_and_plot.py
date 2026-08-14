@@ -42,73 +42,100 @@ def make_folds(start: str, end: str, train_years: int, test_months: int):
 def compute_returns_for_fold(tickers, test_start: str, test_end: str):
     """
     Robustly compute average return across tickers between test_start and test_end.
-    Uses yf.Ticker(...).history with retries and logs diagnostic info.
-    Returns a float return (e.g., 0.02 for +2%).
+    Tries in order:
+      1) yf.Ticker(...).history()
+      2) yf.download(...)
+      3) pandas_datareader (stooq) as a last resort
+    Returns a float return (e.g., 0.02 for +2%). Logs diagnostic details for each attempt.
     """
     max_attempts = 3
     end_plus1 = (pd.to_datetime(test_end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
-    def fetch_single(ticker):
+    def try_ticker_history(ticker):
         tk = yf.Ticker(ticker)
-        # NOTE: do NOT pass 'progress' here because some yfinance versions don't accept it
         hist = tk.history(start=test_start, end=end_plus1)
+        logger.info("history() for %s returned shape=%s", ticker, None if hist is None else getattr(hist, "shape", None))
         return hist
 
+    def try_yf_download(ticker):
+        # yf.download sometimes returns data when Ticker.history doesn't
+        df = yf.download(ticker, start=test_start, end=end_plus1, progress=False, threads=False)
+        logger.info("yf.download for %s returned shape=%s", ticker, None if df is None else getattr(df, "shape", None))
+        return df
+
+    def try_pdr_stooq(ticker):
+        try:
+            df = pdr.DataReader(ticker, "stooq", start=test_start, end=end_plus1)
+            # stooq returns index in descending order; sort by index
+            if df is not None and not df.empty:
+                df = df.sort_index()
+            logger.info("pandas_datareader(stooq) for %s returned shape=%s", ticker, None if df is None else getattr(df, "shape", None))
+            return df
+        except Exception as exc:
+            logger.info("pandas_datareader(stooq) failed for %s: %s", ticker, exc)
+            return None
+
+    # helper to compute return from a dataframe that must include 'Close' or an equivalent column
+    def compute_from_df(df, ticker):
+        if df is None or df.empty:
+            return None
+        # select Close-like column
+        if "Close" in df:
+            ser = df["Close"].dropna()
+        elif "close" in df:
+            ser = df["close"].dropna()
+        elif "Close**" in df:  # just in case of weird names
+            ser = df.iloc[:, -1].dropna()
+        else:
+            # try last column
+            ser = df.iloc[:, df.shape[1] - 1].dropna() if df.shape[1] > 0 else pd.Series(dtype=float)
+        if ser.empty:
+            return None
+        entry = ser.iloc[0]
+        exit = ser.iloc[-1]
+        return float((exit / entry) - 1.0)
+
+    # When tickers is a list, compute per-ticker and average; otherwise single ticker flow
     for attempt in range(1, max_attempts + 1):
         try:
             if isinstance(tickers, (list, tuple)) and len(tickers) > 1:
                 rets = []
                 for t in tickers:
-                    try:
-                        hist = fetch_single(t)
-                        if hist is None or hist.empty or "Close" not in hist:
-                            logger.warning(
-                                "Ticker %s: no data (attempt %d) for %s-%s; hist shape=%s",
-                                t,
-                                attempt,
-                                test_start,
-                                test_end,
-                                None if hist is None else getattr(hist, "shape", None),
-                            )
-                            continue
-                        close = hist["Close"].dropna()
-                        if close.empty:
-                            logger.warning(
-                                "Ticker %s: Close series empty (attempt %d) for %s-%s",
-                                t,
-                                attempt,
-                                test_start,
-                                test_end,
-                            )
-                            continue
-                        entry = close.iloc[0]
-                        exit = close.iloc[-1]
-                        rets.append((exit / entry) - 1.0)
-                    except Exception as exc:
-                        logger.warning("Ticker %s history exception (attempt %d): %s", t, attempt, exc)
+                    # try methods in order
+                    for method, fn in (("history", try_ticker_history), ("download", try_yf_download), ("stooq", try_pdr_stooq)):
+                        try:
+                            df = fn(t)
+                        except Exception as exc:
+                            logger.warning("Method %s raised for %s (attempt %d): %s", method, t, attempt, exc)
+                            df = None
+                        r = compute_from_df(df, t)
+                        if r is not None:
+                            logger.info("Method %s succeeded for %s: return=%0.6f", method, t, r)
+                            rets.append(r)
+                            break
+                        else:
+                            logger.info("Method %s returned no usable data for %s (attempt %d)", method, t, attempt)
+                    # continue to next ticker
                 if not rets:
-                    raise RuntimeError("no valid ticker returns found")
+                    raise RuntimeError("no valid ticker returns found across methods")
                 return float(sum(rets) / len(rets))
             else:
                 t = tickers[0] if isinstance(tickers, (list, tuple)) else tickers
-                hist = fetch_single(t)
-                if hist is None or hist.empty or "Close" not in hist:
-                    raise RuntimeError(f"No data for ticker {t}")
-                close = hist["Close"].dropna()
-                if close.empty:
-                    raise RuntimeError(f"No close prices for {t}")
-                entry = close.iloc[0]
-                exit = close.iloc[-1]
-                return float((exit / entry) - 1.0)
+                for method, fn in (("history", try_ticker_history), ("download", try_yf_download), ("stooq", try_pdr_stooq)):
+                    try:
+                        df = fn(t)
+                    except Exception as exc:
+                        logger.warning("Method %s raised for %s (attempt %d): %s", method, t, attempt, exc)
+                        df = None
+                    r = compute_from_df(df, t)
+                    if r is not None:
+                        logger.info("Method %s succeeded for %s: return=%0.6f", method, t, r)
+                        return r
+                    else:
+                        logger.info("Method %s returned no usable data for %s (attempt %d)", method, t, attempt)
+                raise RuntimeError(f"No data for ticker {t}")
         except Exception as exc:
-            logger.warning(
-                "Attempt %d: Failed to compute returns for %s (%s-%s): %s",
-                attempt,
-                tickers,
-                test_start,
-                test_end,
-                exc,
-            )
+            logger.warning("Attempt %d: Failed to compute returns for %s (%s-%s): %s", attempt, tickers, test_start, test_end, exc)
             if attempt < max_attempts:
                 sleep_s = 2 ** attempt
                 logger.info("Sleeping %d seconds before retry...", sleep_s)
