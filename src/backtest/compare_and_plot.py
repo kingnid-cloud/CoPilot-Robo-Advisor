@@ -82,9 +82,9 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             logger.info("Tickerbot base URL not set; skipping tickerbot for %s", ticker)
             return None
 
-        # Strict v2/history call only (asof + interval + limit). Avoid sending 'start' which causes 400.
+        # v2/history: use asof + interval only (Tickerbot accepts asof, interval, ticker)
         url = f"{tickerbot_base}/v2/tickers/{ticker}/history"
-        params = {"interval": "1d", "asof": test_end, "limit": 10000}
+        params = {"interval": "1d", "asof": test_end}
         headers = {}
         if tickerbot_key:
             headers["Authorization"] = f"Bearer {tickerbot_key}"
@@ -100,7 +100,8 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             except Exception:
                 logger.info("Tickerbot response not JSON for %s", url)
                 return None
-            # Parse common shapes: list-of-dicts or dict with 'series'/'data' keys or date->value mapping
+
+            # Extract price list from common keys or date->value mapping
             prices = None
             if isinstance(j, dict):
                 for k in ("series", "data", "prices", "items", "results"):
@@ -108,14 +109,17 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                         prices = j[k]
                         break
             if prices is None and isinstance(j, dict):
+                # detect date->value mapping
                 date_keys = [k for k in j.keys() if isinstance(k, str) and k.count("-") == 2]
                 if date_keys:
                     prices = [{"date": k, **(j[k] if isinstance(j[k], dict) else {"close": j[k]})} for k in date_keys]
             if prices is None and isinstance(j, list):
                 prices = j
+
             if not prices:
                 logger.info("Tickerbot v2/history returned no usable prices (keys=%s)", list(j.keys())[:6] if isinstance(j, dict) else None)
                 return None
+
             df = pd.DataFrame(prices)
             if "date" in df.columns:
                 df["date"] = pd.to_datetime(df["date"])
@@ -124,6 +128,13 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                 df = df.rename(columns={"close": "Close"})
             if "Close" in df.columns:
                 df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+
+            # Filter to requested window (test_start..test_end) in case API returns extra points
+            try:
+                df = df[(df.index >= pd.to_datetime(test_start)) & (df.index <= pd.to_datetime(test_end))]
+            except Exception:
+                pass
+
             logger.info("Tickerbot for %s via %s returned shape=%s", ticker, url, getattr(df, "shape", None))
             return df
         except Exception as exc:
