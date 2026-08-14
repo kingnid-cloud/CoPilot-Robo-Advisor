@@ -39,7 +39,7 @@ def make_folds(start: str, end: str, train_years: int, test_months: int):
 def compute_returns_for_fold(tickers, test_start: str, test_end: str):
     """
     Multi-source, robust return computation.
-    Uses Tickerbot /v2/series for ranges first, falls back to snapshot or other sources.
+    Uses Tickerbot /v2/series for ranges first, falls back to snapshot-based series if needed.
     Returns a float (arithmetic mean across tickers if tickers is a list).
     """
     max_attempts = 3
@@ -99,28 +99,21 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
         if j is None:
             return None
 
-        # If top-level is a list of rows, return it
         if isinstance(j, list):
-            # Prefer list-of-dicts
             if j and isinstance(j[0], dict):
                 return j
             return None
 
-        # If top-level dict
         if isinstance(j, dict):
-            # If top-level contains series-like keys
             for k in ("series", "data", "prices", "items", "results", "values"):
                 if k in j and (isinstance(j[k], list) or isinstance(j[k], dict)):
                     return j[k]
-
-            # If top-level is a date->value map
             date_keys = [k for k in j.keys() if isinstance(k, str) and (k.count("-") == 2 or k.isdigit())]
             if date_keys:
                 try:
                     return [{"date": k, **(j[k] if isinstance(j[k], dict) else {"close": j[k]})} for k in date_keys]
                 except Exception:
                     pass
-
         return None
 
     def try_tickerbot(ticker):
@@ -145,10 +138,8 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                 except Exception:
                     logger.info("Tickerbot series response not JSON for %s", url_series)
                     j = None
-                # parse common shapes
                 prices = parse_prices_from_json(j)
                 if prices is not None:
-                    # Normalize dict-of-arrays if needed
                     if isinstance(prices, dict):
                         try:
                             prices = [{"date": k, **(prices[k] if isinstance(prices[k], dict) else {"close": prices[k]})} for k in prices.keys()]
@@ -159,7 +150,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                     except Exception as exc:
                         logger.info("pd.DataFrame(prices) failed for series: %s", exc)
                         return None
-                    # Normalize
                     if "date" in df.columns:
                         try:
                             df["date"] = pd.to_datetime(df["date"])
@@ -172,7 +162,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                         df = df.rename(columns={"close": "Close"})
                     if "Close" in df.columns:
                         df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-                    # write parsed debug
                     try:
                         parsed_debug = {"source": "series", "parsed_shape": getattr(df, "shape", None), "columns": list(df.columns)}
                         if "Close" in df:
@@ -189,6 +178,67 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
         except Exception as exc:
             logger.info("Tickerbot series request failed for %s: %s", ticker, exc)
 
+        # 1b) If /v2/series returns 400 or no data, fall back to building a series by querying snapshot per day
+        try:
+            # Build per-day series by calling snapshot endpoint for each date in range
+            start_dt = pd.to_datetime(test_start).normalize()
+            end_dt = pd.to_datetime(test_end).normalize()
+            days = (end_dt - start_dt).days + 1
+            if days <= 0:
+                return None
+            # safety cap to avoid runaway calls; increase if you need long spans
+            max_days = 4000
+            if days > max_days:
+                logger.info("Requested range %d days too large for snapshot fallback; skipping snapshot build", days)
+            else:
+                rows = []
+                url_tick = f"{tickerbot_base}/v2/tickers/{ticker}"
+                for d in pd.date_range(start_dt, end_dt, freq="D"):
+                    dstr = d.strftime("%Y-%m-%d")
+                    try:
+                        resp = requests.get(url_tick, params={"asof": dstr}, headers=headers, timeout=10)
+                        # save a small sample of the raw per-day response to debug (first few)
+                        if len(rows) < 3:
+                            save_bytes(debug_dir / f"tickerbot_raw_snapshot_sample_{ticker}_{dstr}.json", resp.content)
+                        if resp.status_code != 200:
+                            continue
+                        try:
+                            j = resp.json()
+                        except Exception:
+                            continue
+                        if isinstance(j, dict) and "data" in j and isinstance(j["data"], dict):
+                            val = None
+                            if "price" in j["data"]:
+                                val = j["data"]["price"]
+                            elif "Close" in j["data"]:
+                                val = j["data"]["Close"]
+                            elif "close" in j["data"]:
+                                val = j["data"]["close"]
+                            if val is not None:
+                                rows.append({"date": dstr, "Close": val})
+                        time.sleep(0.05)
+                    except Exception:
+                        # ignore single-day errors
+                        continue
+                if rows:
+                    df = pd.DataFrame(rows)
+                    try:
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.set_index("date").sort_index()
+                    except Exception:
+                        pass
+                    if "Close" in df.columns:
+                        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+                    try:
+                        parsed_debug = {"source": "snapshot_series", "parsed_shape": getattr(df, "shape", None), "sample_rows": rows[:3]}
+                        (debug_dir / f"tickerbot_parsed_snapshotseries_{ticker}_{test_start}_{test_end}.json").write_text(json.dumps(parsed_debug), encoding="utf-8")
+                    except Exception:
+                        pass
+                    logger.info("Built snapshot-based series for %s with %d rows", ticker, getattr(df, "shape", None)[0] if getattr(df, "shape", None) else 0)
+                    return df
+        except Exception as exc:
+            logger.info("Tickerbot snapshot-series fallback failed for %s: %s", ticker, exc)
+
         # 2) Fallback: snapshot via /v2/tickers/{ticker}?asof= (single moment)
         try:
             url_tick = f"{tickerbot_base}/v2/tickers/{ticker}"
@@ -202,7 +252,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                 except Exception:
                     logger.info("Tickerbot tick response not JSON for %s", url_tick)
                     j = None
-                # If snapshot with j["data"]["price"] -> return single-row DF
                 if isinstance(j, dict) and "data" in j and isinstance(j["data"], dict) and ("price" in j["data"] or "Close" in j["data"]):
                     try:
                         price_val = j["data"].get("price") if "price" in j["data"] else j["data"].get("Close")
@@ -219,37 +268,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                         return df
                     except Exception as exc:
                         logger.info("Failed to convert Tickerbot snapshot to DataFrame: %s", exc)
-                # else try to find series-like content inside the snapshot response
-                prices = None
-                if isinstance(j, dict):
-                    # if response contains a field that is a list-of-rows
-                    prices = parse_prices_from_json(j)
-                if prices is not None:
-                    try:
-                        df = pd.DataFrame(prices)
-                    except Exception as exc:
-                        logger.info("pd.DataFrame(prices) failed for tick snapshot: %s", exc)
-                        return None
-                    if "date" in df.columns:
-                        try:
-                            df["date"] = pd.to_datetime(df["date"])
-                            df = df.set_index("date").sort_index()
-                        except Exception:
-                            pass
-                    if "price" in df.columns and "Close" not in df.columns:
-                        df = df.rename(columns={"price": "Close"})
-                    if "close" in df.columns and "Close" not in df.columns:
-                        df = df.rename(columns={"close": "Close"})
-                    if "Close" in df.columns:
-                        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-                    try:
-                        parsed_debug = {"source": "tick_inner_series", "parsed_shape": getattr(df, "shape", None), "columns": list(df.columns)}
-                        (debug_dir / f"tickerbot_parsed_tickinner_{ticker}_{test_start}_{test_end}.json").write_text(json.dumps(parsed_debug), encoding="utf-8")
-                    except Exception:
-                        pass
-                    return df
-            else:
-                logger.info("Tickerbot /v2/tickers returned status %s for %s", resp.status_code, url_tick)
         except Exception as exc:
             logger.info("Tickerbot tick request failed for %s: %s", ticker, exc)
 
