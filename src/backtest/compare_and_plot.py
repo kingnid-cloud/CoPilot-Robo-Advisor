@@ -136,9 +136,7 @@ def _tickerbot_series(
 ) -> pd.DataFrame | None:
     """
     Primary source: Tickerbot /v2/series — aligned grid of prices over time.
-
-    Multi-source, robust return computation. Uses Tickerbot /v2/series for ranges first,
-    falls back to snapshot-based series if needed.
+    Uses correct parameters: from=, to=
     """
     base = os.environ.get("TICKERBOT_URL", "https://api.tickerbot.io").strip().rstrip("/")
     key = os.environ.get("TICKERBOT_API_KEY", "").strip()
@@ -155,8 +153,8 @@ def _tickerbot_series(
         "tickers": ticker,
         "columns": "price",
         "interval": "1d",
-        "start": start,
-        "end": end,
+        "from": start,
+        "to": end,
     }
 
     try:
@@ -168,48 +166,38 @@ def _tickerbot_series(
         logger.info("Tickerbot /v2/series %s status=%s", url, resp.status_code)
         if resp.status_code != 200:
             return None
-        try:
-            j = resp.json()
-        except Exception:
-            logger.info("Tickerbot /v2/series response not JSON for %s", url)
-            return None
 
+        j = resp.json()
         prices = _parse_prices_from_json(j)
         if prices is None:
-            logger.info("Tickerbot /v2/series returned 200 but no price list for %s", ticker)
             return None
 
         if isinstance(prices, dict):
-            try:
-                prices = [
-                    {
-                        "date": k,
-                        **(
-                            prices[k]
-                            if isinstance(prices[k], dict)
-                            else {"close": prices[k]}
-                        ),
-                    }
-                    for k in prices.keys()
-                ]
-            except Exception:
-                prices = [prices]
+            prices = [
+                {
+                    "date": k,
+                    **(
+                        prices[k]
+                        if isinstance(prices[k], dict)
+                        else {"close": prices[k]}
+                    ),
+                }
+                for k in prices.keys()
+            ]
 
         df = pd.DataFrame(prices)
         if "date" in df.columns:
-            try:
-                df["date"] = pd.to_datetime(df["date"])
-                df = df.set_index("date").sort_index()
-            except Exception:
-                pass
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()
+
         if "price" in df.columns and "Close" not in df.columns:
             df = df.rename(columns={"price": "Close"})
         if "close" in df.columns and "Close" not in df.columns:
             df = df.rename(columns={"close": "Close"})
-        if "Close" in df.columns:
-            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
 
         return df
+
     except Exception as exc:
         logger.info("Tickerbot /v2/series request failed for %s: %s", ticker, exc)
         return None
