@@ -50,7 +50,8 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
 
     def fetch_single(ticker):
         tk = yf.Ticker(ticker)
-        hist = tk.history(start=test_start, end=end_plus1, progress=False)
+        # NOTE: do NOT pass 'progress' here because some yfinance versions don't accept it
+        hist = tk.history(start=test_start, end=end_plus1)
         return hist
 
     for attempt in range(1, max_attempts + 1):
