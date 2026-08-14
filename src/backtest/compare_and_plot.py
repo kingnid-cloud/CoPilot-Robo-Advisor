@@ -12,7 +12,7 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import importlib
 from dateutil.relativedelta import relativedelta
-
+import pandas_datareader.data as pdr
 logger = logging.getLogger("compare_backtest")
 logging.basicConfig(level=logging.INFO)
 
