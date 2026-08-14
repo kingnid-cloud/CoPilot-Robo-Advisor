@@ -19,6 +19,10 @@ on:
         description: 'Test window in months'
         required: false
         default: '6'
+      source_mode:
+        description: 'Data source mode (auto/tickerbot/snapshot/fmp/yf)'
+        required: false
+        default: 'auto'
 
 jobs:
   run-backtest:
@@ -59,12 +63,21 @@ jobs:
           TICKERBOT_API_KEY: ${{ secrets.TICKERBOT_API_KEY }}
           ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
           TICKERBOT_URL: ${{ secrets.TICKERBOT_URL }}
+          FMP_KEY: ${{ secrets.FMP_KEY }}
         run: |
           START=${{ github.event.inputs.start || '2000-01-01' }}
           END=${{ github.event.inputs.end || '2025-01-01' }}
           TRAIN=${{ github.event.inputs.train_years || '5' }}
           TEST=${{ github.event.inputs.test_months || '6' }}
-          python -m src.backtest.compare_and_plot --tickers SPY --start "$START" --end "$END" --train-years "$TRAIN" --test-months "$TEST" --out outputs/backtest
+          SOURCE_MODE=${{ github.event.inputs.source_mode || 'auto' }}
+          python -m src.backtest.compare_and_plot \
+            --tickers SPY \
+            --start "$START" \
+            --end "$END" \
+            --train-years "$TRAIN" \
+            --test-months "$TEST" \
+            --out outputs/backtest \
+            --source-mode "$SOURCE_MODE"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -73,3 +86,4 @@ jobs:
           path: |
             outputs/backtest.*
             outputs/debug/**
+            outputs/cache/**
