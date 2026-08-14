@@ -82,59 +82,53 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             logger.info("Tickerbot base URL not set; skipping tickerbot for %s", ticker)
             return None
 
-        # Use v2/history with asof + interval + limit (per Tickerbot docs/error response)
-        endpoints = [
-            (f"{tickerbot_base}/v2/tickers/{ticker}/history", {"interval": "1d", "asof": test_end, "limit": 10000}),
-            # fallback shapes (some accounts/versions)
-            (f"{tickerbot_base}/v2/tickers/{ticker}/series", {"start": test_start, "end": test_end, "granularity": "d"}),
-            (f"{tickerbot_base}/v1/tickers/{ticker}/series", {"start": test_start, "end": test_end, "granularity": "d"}),
-            (f"{tickerbot_base}/tickers/{ticker}", {"start": test_start, "end": test_end}),
-        ]
+        # Strict v2/history call only (asof + interval + limit). Avoid sending 'start' which causes 400.
+        url = f"{tickerbot_base}/v2/tickers/{ticker}/history"
+        params = {"interval": "1d", "asof": test_end, "limit": 10000}
         headers = {}
         if tickerbot_key:
             headers["Authorization"] = f"Bearer {tickerbot_key}"
-        for url, params in endpoints:
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
+            save_bytes(debug_dir / f"tickerbot_raw_{ticker}_{test_start}_{test_end}.json", resp.content)
+            logger.info("Tickerbot checked %s status=%s", url, resp.status_code)
+            if resp.status_code != 200:
+                logger.info("Tickerbot returned status %s for %s", resp.status_code, url)
+                return None
             try:
-                resp = requests.get(url, params=params, headers=headers, timeout=30)
-                save_bytes(debug_dir / f"tickerbot_raw_{ticker}_{test_start}_{test_end}.json", resp.content)
-                logger.info("Tickerbot checked %s status=%s", url, resp.status_code)
-                if resp.status_code != 200:
-                    logger.info("Tickerbot returned status %s for %s", resp.status_code, url)
-                    continue
-                try:
-                    j = resp.json()
-                except Exception:
-                    logger.info("Tickerbot response not JSON for %s", url)
-                    continue
-                # Common shapes: { "series": [...] } or { "data": [...] } or list of dicts or date->value mapping
-                prices = None
+                j = resp.json()
+            except Exception:
+                logger.info("Tickerbot response not JSON for %s", url)
+                return None
+            # Parse common shapes: list-of-dicts or dict with 'series'/'data' keys or date->value mapping
+            prices = None
+            if isinstance(j, dict):
                 for k in ("series", "data", "prices", "items", "results"):
-                    if isinstance(j, dict) and k in j:
+                    if k in j:
                         prices = j[k]
                         break
-                if prices is None and isinstance(j, dict):
-                    date_keys = [k for k in j.keys() if isinstance(k, str) and k.count("-") == 2]
-                    if date_keys:
-                        prices = [{"date": k, **(j[k] if isinstance(j[k], dict) else {"close": j[k]})} for k in date_keys]
-                if prices is None and isinstance(j, list):
-                    prices = j
-                if not prices:
-                    logger.info("Tickerbot endpoint %s returned no usable prices (keys=%s)", url, list(j.keys())[:6] if isinstance(j, dict) else None)
-                    continue
-                df = pd.DataFrame(prices)
-                if "date" in df.columns:
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.set_index("date").sort_index()
-                if "close" in df.columns and "Close" not in df.columns:
-                    df = df.rename(columns={"close": "Close"})
-                if "Close" in df.columns:
-                    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-                logger.info("Tickerbot for %s via %s returned shape=%s", ticker, url, getattr(df, "shape", None))
-                return df
-            except Exception as exc:
-                logger.info("Tickerbot request failed for %s on %s: %s", ticker, url, exc)
-                continue
-        return None
+            if prices is None and isinstance(j, dict):
+                date_keys = [k for k in j.keys() if isinstance(k, str) and k.count("-") == 2]
+                if date_keys:
+                    prices = [{"date": k, **(j[k] if isinstance(j[k], dict) else {"close": j[k]})} for k in date_keys]
+            if prices is None and isinstance(j, list):
+                prices = j
+            if not prices:
+                logger.info("Tickerbot v2/history returned no usable prices (keys=%s)", list(j.keys())[:6] if isinstance(j, dict) else None)
+                return None
+            df = pd.DataFrame(prices)
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.set_index("date").sort_index()
+            if "close" in df.columns and "Close" not in df.columns:
+                df = df.rename(columns={"close": "Close"})
+            if "Close" in df.columns:
+                df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+            logger.info("Tickerbot for %s via %s returned shape=%s", ticker, url, getattr(df, "shape", None))
+            return df
+        except Exception as exc:
+            logger.info("Tickerbot request failed for %s on %s: %s", ticker, url, exc)
+            return None
 
     def try_ticker_history(ticker):
         try:
