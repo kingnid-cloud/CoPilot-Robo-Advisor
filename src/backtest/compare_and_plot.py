@@ -54,22 +54,30 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
     def compute_from_df(df):
         if df is None or df.empty:
             return None, 0
-        # Prefer 'Close' (case-insensitive)
-        if "Close" in df:
-            ser = df["Close"].dropna()
-        elif "close" in df:
-            ser = df["close"].dropna()
-        else:
+        # Normalize possible column names
+        if "Close" not in df and "close" in df:
+            df = df.rename(columns={"close": "Close"})
+        # If Close still missing, pick last numeric column
+        if "Close" not in df:
             numeric_cols = df.select_dtypes(include="number").columns
             if len(numeric_cols) == 0:
-                ser = pd.Series(dtype=float)
-            else:
-                ser = df[numeric_cols[-1]].dropna()
-        if ser.empty:
+                return None, 0
+            df = df.rename(columns={numeric_cols[-1]: "Close"})
+        # Ensure numeric
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        # Drop NaN and non-positive prices (zero/negative)
+        closes = df["Close"].dropna()
+        closes = closes[closes > 0]
+        if closes.empty or len(closes) < 2:
             return None, 0
-        entry = ser.iloc[0]
-        exit = ser.iloc[-1]
-        return float((exit / entry) - 1.0), len(ser)
+        entry = closes.iloc[0]
+        exit = closes.iloc[-1]
+        # sanity: if entry is extremely small relative to median, treat as suspicious
+        med = closes.median()
+        if entry < 1e-6 or entry < med * 1e-4:
+            # treat as invalid data
+            return None, 0
+        return float((exit / entry) - 1.0), len(closes)
 
     def save_bytes(path: Path, b: bytes):
         try:
@@ -171,6 +179,16 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                 df = df.rename(columns={"close": "Close"})
             if "Close" in df.columns:
                 df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+
+            # Write parsed debug summary for inspection
+            try:
+                parsed_debug = {"parsed_shape": getattr(df, "shape", None), "columns": list(df.columns)}
+                if "Close" in df:
+                    desc = df["Close"].describe().to_dict()
+                    parsed_debug["close_describe"] = {k: (float(v) if pd.notna(v) else None) for k, v in desc.items()}
+                (debug_dir / f"tickerbot_parsed_{ticker}_{test_start}_{test_end}.json").write_text(json.dumps(parsed_debug), encoding="utf-8")
+            except Exception:
+                logger.exception("Failed to write parsed debug for tickerbot")
 
             # Filter to requested window (test_start..test_end) in case API returns extra points
             try:
