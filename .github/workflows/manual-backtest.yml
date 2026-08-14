@@ -37,6 +37,24 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install statsmodels hmmlearn scikit-learn pandas-datareader scikit-fuzzy ta matplotlib yfinance requests
 
+      - name: Tickerbot quick check
+        env:
+          TICKERBOT_API_KEY: ${{ secrets.TICKERBOT_API_KEY }}
+          TICKERBOT_URL: ${{ secrets.TICKERBOT_URL }}
+        run: |
+          echo "Tickerbot base: $TICKERBOT_URL"
+          echo "Requesting SPY series (2005-01-01..2005-06-30) -> /v1/tickers/{ticker}/series"
+          curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
+            "$TICKERBOT_URL/v1/tickers/SPY/series?start=2005-01-01&end=2005-06-30&granularity=d" | sed -n '1,200p' || true
+          echo
+          echo "Trying alternative endpoint: /v1/tickers/{ticker}/signals/close"
+          curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
+            "$TICKERBOT_URL/v1/tickers/SPY/signals/close?start=2005-01-01&end=2005-06-30" | sed -n '1,200p' || true
+          echo
+          echo "Trying top-level /v1/tickers/{ticker}"
+          curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
+            "$TICKERBOT_URL/v1/tickers/SPY?start=2005-01-01&end=2005-06-30" | sed -n '1,200p' || true
+
       - name: Run compare backtest
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
@@ -54,4 +72,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: backtest-artifacts
-          path: outputs/backtest.*
+          path: |
+            outputs/backtest.*
+            outputs/debug/**
