@@ -43,17 +43,17 @@ jobs:
           TICKERBOT_URL: ${{ secrets.TICKERBOT_URL }}
         run: |
           echo "Tickerbot base: $TICKERBOT_URL"
-          echo "Requesting SPY series (2005-01-01..2005-06-30) -> /v1/tickers/{ticker}/series"
+          echo "Requesting SPY history (2005-01-01..2005-06-30) -> /v2/tickers/{ticker}/history"
+          curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
+            "$TICKERBOT_URL/v2/tickers/SPY/history?start=2005-01-01&end=2005-06-30&interval=1d" | sed -n '1,200p' || true
+          echo
+          echo "Trying alternative endpoint: /v2/tickers/{ticker}/series"
+          curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
+            "$TICKERBOT_URL/v2/tickers/SPY/series?start=2005-01-01&end=2005-06-30&granularity=d" | sed -n '1,200p' || true
+          echo
+          echo "Trying fallback endpoint: /v1/tickers/{ticker}/series"
           curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
             "$TICKERBOT_URL/v1/tickers/SPY/series?start=2005-01-01&end=2005-06-30&granularity=d" | sed -n '1,200p' || true
-          echo
-          echo "Trying alternative endpoint: /v1/tickers/{ticker}/signals/close"
-          curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
-            "$TICKERBOT_URL/v1/tickers/SPY/signals/close?start=2005-01-01&end=2005-06-30" | sed -n '1,200p' || true
-          echo
-          echo "Trying top-level /v1/tickers/{ticker}"
-          curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
-            "$TICKERBOT_URL/v1/tickers/SPY?start=2005-01-01&end=2005-06-30" | sed -n '1,200p' || true
 
       - name: Run compare backtest
         env:
