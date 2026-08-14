@@ -1,4 +1,5 @@
 name: Manual Backtest Run
+
 on:
   workflow_dispatch:
     inputs:
@@ -22,6 +23,7 @@ on:
 jobs:
   run-backtest:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,17 +45,13 @@ jobs:
           TICKERBOT_URL: ${{ secrets.TICKERBOT_URL }}
         run: |
           echo "Tickerbot base: $TICKERBOT_URL"
-          echo "Requesting SPY history (2005-01-01..2005-06-30) -> /v2/tickers/{ticker}/history (asof)"
+          echo "Requesting SPY daily price series (2005-01-01..2005-06-30) via /v2/series"
           curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
-            "$TICKERBOT_URL/v2/tickers/SPY/history?interval=1d&asof=2005-06-30" | sed -n '1,200p' || true
+            "$TICKERBOT_URL/v2/series?tickers=SPY&columns=price&interval=1d&start=2005-01-01&end=2005-06-30" | sed -n '1,200p' || true
           echo
-          echo "Trying alternative (fallback) endpoint: /v2/tickers/{ticker}/series (kept for debug)"
+          echo "Requesting SPY snapshot as-of 2005-06-30 via /v2/tickers/{ticker}?asof="
           curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
-            "$TICKERBOT_URL/v2/tickers/SPY/series?start=2005-01-01&end=2005-06-30&granularity=d" | sed -n '1,200p' || true
-          echo
-          echo "Trying fallback endpoint: /v1/tickers/{ticker}/series"
-          curl -i -sS -H "Authorization: Bearer $TICKERBOT_API_KEY" \
-            "$TICKERBOT_URL/v1/tickers/SPY/series?start=2005-01-01&end=2005-06-30&granularity=d" | sed -n '1,200p' || true
+            "$TICKERBOT_URL/v2/tickers/SPY?asof=2005-06-30" | sed -n '1,200p' || true
 
       - name: Run compare backtest
         env:
