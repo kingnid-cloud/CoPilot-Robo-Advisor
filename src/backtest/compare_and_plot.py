@@ -39,7 +39,7 @@ def make_folds(start: str, end: str, train_years: int, test_months: int):
 def compute_returns_for_fold(tickers, test_start: str, test_end: str):
     """
     Multi-source, robust return computation.
-    Tickerbot (v2 history) is tried first. Debug outputs written to outputs/debug/.
+    Uses Tickerbot /v2/series for ranges first, falls back to snapshot or other sources.
     Returns a float (arithmetic mean across tickers if tickers is a list).
     """
     max_attempts = 3
@@ -55,6 +55,8 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
         if df is None or df.empty:
             return None, 0
         # Normalize possible column names
+        if "Close" not in df and "price" in df:
+            df = df.rename(columns={"price": "Close"})
         if "Close" not in df and "close" in df:
             df = df.rename(columns={"close": "Close"})
         # If Close still missing, pick last numeric column
@@ -75,7 +77,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
         # sanity: if entry is extremely small relative to median, treat as suspicious
         med = closes.median()
         if entry < 1e-6 or entry < med * 1e-4:
-            # treat as invalid data
             return None, 0
         return float((exit / entry) - 1.0), len(closes)
 
@@ -86,121 +87,173 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
         except Exception:
             logger.exception("Failed to write debug file %s", path)
 
+    def parse_prices_from_json(j):
+        """
+        Return a list-of-dicts (rows) or None if not found.
+        Handles:
+         - dict with keys 'series'|'data'|'prices' -> list
+         - dict mapping date->scalar or date->{close:...}
+         - list of dicts
+         - dict with top-level 'data' snapshot (handled separately)
+        """
+        if j is None:
+            return None
+
+        # If top-level is a list of rows, return it
+        if isinstance(j, list):
+            # Prefer list-of-dicts
+            if j and isinstance(j[0], dict):
+                return j
+            return None
+
+        # If top-level dict
+        if isinstance(j, dict):
+            # If top-level contains series-like keys
+            for k in ("series", "data", "prices", "items", "results", "values"):
+                if k in j and (isinstance(j[k], list) or isinstance(j[k], dict)):
+                    return j[k]
+
+            # If top-level is a date->value map
+            date_keys = [k for k in j.keys() if isinstance(k, str) and (k.count("-") == 2 or k.isdigit())]
+            if date_keys:
+                try:
+                    return [{"date": k, **(j[k] if isinstance(j[k], dict) else {"close": j[k]})} for k in date_keys]
+                except Exception:
+                    pass
+
+        return None
+
     def try_tickerbot(ticker):
         if not tickerbot_base:
             logger.info("Tickerbot base URL not set; skipping tickerbot for %s", ticker)
             return None
 
-        # v2/history: use asof + interval only (Tickerbot accepts asof, interval, ticker)
-        url = f"{tickerbot_base}/v2/tickers/{ticker}/history"
-        params = {"interval": "1d", "asof": test_end}
         headers = {}
         if tickerbot_key:
             headers["Authorization"] = f"Bearer {tickerbot_key}"
+
+        # 1) Preferred: /v2/series for a real time series when we have start/end
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=30)
-            save_bytes(debug_dir / f"tickerbot_raw_{ticker}_{test_start}_{test_end}.json", resp.content)
-            logger.info("Tickerbot checked %s status=%s", url, resp.status_code)
-            if resp.status_code != 200:
-                logger.info("Tickerbot returned status %s for %s", resp.status_code, url)
-                return None
-            try:
-                j = resp.json()
-            except Exception:
-                logger.info("Tickerbot response not JSON for %s", url)
-                return None
-
-            # Heuristics: find the price-series in common shapes
-            prices = None
-
-            # 1) If top-level dict has typical container keys
-            if isinstance(j, dict):
-                for k in ("series", "data", "prices", "items", "results", "values"):
-                    if k in j and (isinstance(j[k], list) or isinstance(j[k], dict)):
-                        prices = j[k]
-                        break
-
-            # 2) If top-level is a dict and keys look like dates, convert mapping -> list
-            if prices is None and isinstance(j, dict):
-                date_keys = [k for k in j.keys() if isinstance(k, str) and (k.count("-") == 2 or k.isdigit())]
-                if date_keys:
-                    try:
-                        prices = [{"date": k, **(j[k] if isinstance(j[k], dict) else {"close": j[k]})} for k in date_keys]
-                    except Exception:
-                        prices = None
-
-            # 3) If top-level is already a list (but elements might be scalars)
-            if prices is None and isinstance(j, list):
-                if j and isinstance(j[0], dict):
-                    prices = j
-                else:
-                    prices = None
-
-            if prices is None:
-                logger.info(
-                    "Tickerbot v2/history returned JSON but no price list detected; saving for inspection (keys=%s)",
-                    list(j.keys())[:8] if isinstance(j, dict) else None,
-                )
-                return None
-
-            # If prices is a dict (object-of-arrays), try converting to list-of-dicts
-            if isinstance(prices, dict):
+            url_series = f"{tickerbot_base}/v2/series"
+            params_series = {"ticker": ticker, "interval": "1d", "start": test_start, "end": test_end}
+            resp = requests.get(url_series, params=params_series, headers=headers, timeout=30)
+            save_bytes(debug_dir / f"tickerbot_raw_series_{ticker}_{test_start}_{test_end}.json", resp.content)
+            logger.info("Tickerbot series checked %s status=%s", url_series, resp.status_code)
+            if resp.status_code == 200:
                 try:
-                    prices = [{"date": k, **(prices[k] if isinstance(prices[k], dict) else {"close": prices[k]})} for k in prices.keys()]
+                    j = resp.json()
                 except Exception:
-                    prices = [prices]
-
-            # Now attempt to build DataFrame; handle scalar-list error gracefully
-            try:
-                df = pd.DataFrame(prices)
-            except ValueError as e:
-                msg = str(e)
-                logger.info("pd.DataFrame(prices) failed: %s", msg)
-                if "If using all scalar values" in msg:
+                    logger.info("Tickerbot series response not JSON for %s", url_series)
+                    j = None
+                # parse common shapes
+                prices = parse_prices_from_json(j)
+                if prices is not None:
+                    # Normalize dict-of-arrays if needed
+                    if isinstance(prices, dict):
+                        try:
+                            prices = [{"date": k, **(prices[k] if isinstance(prices[k], dict) else {"close": prices[k]})} for k in prices.keys()]
+                        except Exception:
+                            prices = [prices]
                     try:
-                        if isinstance(prices, dict):
-                            prices = [{"date": k, "close": v} for k, v in prices.items()]
-                            df = pd.DataFrame(prices)
-                        else:
-                            logger.info("Unable to convert scalar list to DataFrame; skipping ticker")
-                            return None
-                    except Exception as exc2:
-                        logger.info("Fallback DataFrame conversion failed: %s", exc2)
+                        df = pd.DataFrame(prices)
+                    except Exception as exc:
+                        logger.info("pd.DataFrame(prices) failed for series: %s", exc)
                         return None
-
-            # Normalize date/index and 'Close' column
-            if "date" in df.columns:
-                try:
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.set_index("date").sort_index()
-                except Exception:
-                    pass
-            if "close" in df.columns and "Close" not in df.columns:
-                df = df.rename(columns={"close": "Close"})
-            if "Close" in df.columns:
-                df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-
-            # Write parsed debug summary for inspection
-            try:
-                parsed_debug = {"parsed_shape": getattr(df, "shape", None), "columns": list(df.columns)}
-                if "Close" in df:
-                    desc = df["Close"].describe().to_dict()
-                    parsed_debug["close_describe"] = {k: (float(v) if pd.notna(v) else None) for k, v in desc.items()}
-                (debug_dir / f"tickerbot_parsed_{ticker}_{test_start}_{test_end}.json").write_text(json.dumps(parsed_debug), encoding="utf-8")
-            except Exception:
-                logger.exception("Failed to write parsed debug for tickerbot")
-
-            # Filter to requested window (test_start..test_end) in case API returns extra points
-            try:
-                df = df[(df.index >= pd.to_datetime(test_start)) & (df.index <= pd.to_datetime(test_end))]
-            except Exception:
-                pass
-
-            logger.info("Tickerbot for %s via %s returned shape=%s", ticker, url, getattr(df, "shape", None))
-            return df
+                    # Normalize
+                    if "date" in df.columns:
+                        try:
+                            df["date"] = pd.to_datetime(df["date"])
+                            df = df.set_index("date").sort_index()
+                        except Exception:
+                            pass
+                    if "price" in df.columns and "Close" not in df.columns:
+                        df = df.rename(columns={"price": "Close"})
+                    if "close" in df.columns and "Close" not in df.columns:
+                        df = df.rename(columns={"close": "Close"})
+                    if "Close" in df.columns:
+                        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+                    # write parsed debug
+                    try:
+                        parsed_debug = {"source": "series", "parsed_shape": getattr(df, "shape", None), "columns": list(df.columns)}
+                        if "Close" in df:
+                            desc = df["Close"].describe().to_dict()
+                            parsed_debug["close_describe"] = {k: (float(v) if pd.notna(v) else None) for k, v in desc.items()}
+                        (debug_dir / f"tickerbot_parsed_series_{ticker}_{test_start}_{test_end}.json").write_text(json.dumps(parsed_debug), encoding="utf-8")
+                    except Exception:
+                        logger.exception("Failed to write parsed debug for tickerbot series")
+                    return df
+                else:
+                    logger.info("Tickerbot /v2/series returned 200 but no price list detected for %s", ticker)
+            else:
+                logger.info("Tickerbot /v2/series returned status %s for %s", resp.status_code, url_series)
         except Exception as exc:
-            logger.info("Tickerbot request failed for %s on %s: %s", ticker, url, exc)
-            return None
+            logger.info("Tickerbot series request failed for %s: %s", ticker, exc)
+
+        # 2) Fallback: snapshot via /v2/tickers/{ticker}?asof= (single moment)
+        try:
+            url_tick = f"{tickerbot_base}/v2/tickers/{ticker}"
+            params_tick = {"asof": test_end}
+            resp = requests.get(url_tick, params=params_tick, headers=headers, timeout=30)
+            save_bytes(debug_dir / f"tickerbot_raw_tick_{ticker}_{test_start}_{test_end}.json", resp.content)
+            logger.info("Tickerbot tick checked %s status=%s", url_tick, resp.status_code)
+            if resp.status_code == 200:
+                try:
+                    j = resp.json()
+                except Exception:
+                    logger.info("Tickerbot tick response not JSON for %s", url_tick)
+                    j = None
+                # If snapshot with j["data"]["price"] -> return single-row DF
+                if isinstance(j, dict) and "data" in j and isinstance(j["data"], dict) and ("price" in j["data"] or "Close" in j["data"]):
+                    try:
+                        price_val = j["data"].get("price") if "price" in j["data"] else j["data"].get("Close")
+                        date_val = j.get("as_of") or j["data"].get("date") or test_end
+                        df = pd.DataFrame([{"date": date_val, "Close": price_val}])
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.set_index("date").sort_index()
+                        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+                        try:
+                            parsed_debug = {"source": "snapshot", "snapshot_price": (float(price_val) if price_val is not None else None)}
+                            (debug_dir / f"tickerbot_parsed_snapshot_{ticker}_{test_start}_{test_end}.json").write_text(json.dumps(parsed_debug), encoding="utf-8")
+                        except Exception:
+                            pass
+                        return df
+                    except Exception as exc:
+                        logger.info("Failed to convert Tickerbot snapshot to DataFrame: %s", exc)
+                # else try to find series-like content inside the snapshot response
+                prices = None
+                if isinstance(j, dict):
+                    # if response contains a field that is a list-of-rows
+                    prices = parse_prices_from_json(j)
+                if prices is not None:
+                    try:
+                        df = pd.DataFrame(prices)
+                    except Exception as exc:
+                        logger.info("pd.DataFrame(prices) failed for tick snapshot: %s", exc)
+                        return None
+                    if "date" in df.columns:
+                        try:
+                            df["date"] = pd.to_datetime(df["date"])
+                            df = df.set_index("date").sort_index()
+                        except Exception:
+                            pass
+                    if "price" in df.columns and "Close" not in df.columns:
+                        df = df.rename(columns={"price": "Close"})
+                    if "close" in df.columns and "Close" not in df.columns:
+                        df = df.rename(columns={"close": "Close"})
+                    if "Close" in df.columns:
+                        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+                    try:
+                        parsed_debug = {"source": "tick_inner_series", "parsed_shape": getattr(df, "shape", None), "columns": list(df.columns)}
+                        (debug_dir / f"tickerbot_parsed_tickinner_{ticker}_{test_start}_{test_end}.json").write_text(json.dumps(parsed_debug), encoding="utf-8")
+                    except Exception:
+                        pass
+                    return df
+            else:
+                logger.info("Tickerbot /v2/tickers returned status %s for %s", resp.status_code, url_tick)
+        except Exception as exc:
+            logger.info("Tickerbot tick request failed for %s: %s", ticker, exc)
+
+        return None
 
     def try_ticker_history(ticker):
         try:
