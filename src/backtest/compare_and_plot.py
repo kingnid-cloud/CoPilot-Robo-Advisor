@@ -82,9 +82,10 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             logger.info("Tickerbot base URL not set; skipping tickerbot for %s", ticker)
             return None
 
-        # Try multiple likely Tickerbot endpoints; v2/history is first (per docs)
+        # Use v2/history with asof + interval + limit (per Tickerbot docs/error response)
         endpoints = [
-            (f"{tickerbot_base}/v2/tickers/{ticker}/history", {"start": test_start, "end": test_end, "interval": "1d"}),
+            (f"{tickerbot_base}/v2/tickers/{ticker}/history", {"interval": "1d", "asof": test_end, "limit": 10000}),
+            # fallback shapes (some accounts/versions)
             (f"{tickerbot_base}/v2/tickers/{ticker}/series", {"start": test_start, "end": test_end, "granularity": "d"}),
             (f"{tickerbot_base}/v1/tickers/{ticker}/series", {"start": test_start, "end": test_end, "granularity": "d"}),
             (f"{tickerbot_base}/tickers/{ticker}", {"start": test_start, "end": test_end}),
@@ -105,10 +106,10 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                 except Exception:
                     logger.info("Tickerbot response not JSON for %s", url)
                     continue
-                # Common shapes: { "series": [...] } or { "data": [...] } or { "prices": [...] } or mapping date->value
+                # Common shapes: { "series": [...] } or { "data": [...] } or list of dicts or date->value mapping
                 prices = None
                 for k in ("series", "data", "prices", "items", "results"):
-                    if k in j:
+                    if isinstance(j, dict) and k in j:
                         prices = j[k]
                         break
                 if prices is None and isinstance(j, dict):
@@ -118,7 +119,7 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                 if prices is None and isinstance(j, list):
                     prices = j
                 if not prices:
-                    logger.info("Tickerbot endpoint %s returned no usable prices (keys=%s)", url, list(j.keys())[:6])
+                    logger.info("Tickerbot endpoint %s returned no usable prices (keys=%s)", url, list(j.keys())[:6] if isinstance(j, dict) else None)
                     continue
                 df = pd.DataFrame(prices)
                 if "date" in df.columns:
@@ -141,6 +142,7 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             hist = tk.history(start=test_start, end=end_plus1)
             logger.info("history() for %s returned shape=%s", ticker, None if hist is None else getattr(hist, "shape", None))
             if hist is None or getattr(hist, "shape", (0,))[0] == 0:
+                # attempt to save raw Yahoo CSV for debugging
                 try:
                     import calendar as _cal
                     period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
@@ -153,6 +155,7 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             return hist
         except Exception as exc:
             logger.info("Ticker.history() error for %s: %s", ticker, exc)
+            # try to capture raw Yahoo response
             try:
                 import calendar as _cal
                 period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
@@ -172,6 +175,7 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                 df = yf.download(ticker, start=test_start, end=end_plus1)
             logger.info("yf.download for %s returned shape=%s", ticker, None if df is None else getattr(df, "shape", None))
             if df is None or getattr(df, "shape", (0,))[0] == 0:
+                # capture raw CSV
                 try:
                     import calendar as _cal
                     period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
@@ -184,6 +188,7 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             return df
         except Exception as exc:
             logger.info("yf.download error for %s: %s", ticker, exc)
+            # attempt raw fetch for debug
             try:
                 import calendar as _cal
                 period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
@@ -203,6 +208,7 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                     df = df.sort_index()
                 logger.info("pandas_datareader(stooq) for %s returned shape=%s", symbol, None if df is None else getattr(df, "shape", None))
                 if df is None or getattr(df, "shape", (0,))[0] == 0:
+                    # try to capture stooq raw page for debug
                     try:
                         d1 = pd.to_datetime(test_start).strftime("%Y%m%d")
                         d2 = pd.to_datetime(test_end).strftime("%Y%m%d")
@@ -242,6 +248,7 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             df = pd.DataFrame.from_dict(data, orient="index")
             df.index = pd.to_datetime(df.index)
             df = df.sort_index()
+            # normalized 'Close'
             if "5. adjusted close" in df.columns:
                 df = df.rename(columns={"5. adjusted close": "Close"})
                 df["Close"] = df["Close"].astype(float)
