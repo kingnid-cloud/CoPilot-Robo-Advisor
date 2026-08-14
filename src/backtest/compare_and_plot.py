@@ -39,13 +39,8 @@ def make_folds(start: str, end: str, train_years: int, test_months: int):
 def compute_returns_for_fold(tickers, test_start: str, test_end: str):
     """
     Multi-source, robust return computation.
-    Tries in order per ticker:
-      1) yfinance Ticker.history()
-      2) yfinance.download()
-      3) pandas_datareader (stooq)
-      4) Tickerbot.io API (requires TICKERBOT_API_KEY secret)
-      5) AlphaVantage API (requires ALPHAVANTAGE_KEY secret)
-
+    Tries (priority): Tickerbot -> yfinance Ticker.history() -> yf.download() -> pandas_datareader (stooq) -> AlphaVantage
+    Writes small debug files to outputs/debug when raw responses are available.
     Returns a float (arithmetic mean across tickers if tickers is a list).
     """
     max_attempts = 3
@@ -53,6 +48,9 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
     tickerbot_key = os.environ.get("TICKERBOT_API_KEY", "").strip()
     tickerbot_base = os.environ.get("TICKERBOT_URL", "https://api.tickerbot.io").strip().rstrip("/")
     av_key = os.environ.get("ALPHAVANTAGE_KEY", "").strip()
+
+    debug_dir = Path("outputs/debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
 
     def compute_from_df(df):
         if df is None or df.empty:
@@ -73,27 +71,135 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
         entry = ser.iloc[0]; exit = ser.iloc[-1]
         return float((exit / entry) - 1.0), len(ser)
 
+    def save_bytes(path: Path, b: bytes):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b[:2000])
+        except Exception:
+            logger.exception("Failed to write debug file %s", path)
+
+    def try_tickerbot(ticker):
+        if not tickerbot_base:
+            logger.info("Tickerbot base URL not set; skipping tickerbot for %s", ticker)
+            return None
+        # Try the primary "series" endpoint
+        endpoints = [
+            (f"{tickerbot_base}/v1/tickers/{ticker}/series", {"start": test_start, "end": test_end, "granularity": "d"}),
+            (f"{tickerbot_base}/v1/tickers/{ticker}/signals/close", {"start": test_start, "end": test_end}),
+            (f"{tickerbot_base}/v1/tickers/{ticker}", {"start": test_start, "end": test_end}),
+        ]
+        headers = {}
+        if tickerbot_key:
+            headers["Authorization"] = f"Bearer {tickerbot_key}"
+        for url, params in endpoints:
+            try:
+                resp = requests.get(url, params=params, headers=headers, timeout=30)
+                save_bytes(debug_dir / f"tickerbot_raw_{ticker}_{test_start}_{test_end}.json", resp.content)
+                logger.info("Tickerbot checked %s status=%s", url, resp.status_code)
+                if resp.status_code != 200:
+                    logger.info("Tickerbot returned status %s for %s", resp.status_code, url)
+                    continue
+                # Try parse JSON
+                try:
+                    j = resp.json()
+                except Exception:
+                    logger.info("Tickerbot response not JSON for %s", url)
+                    continue
+                # Common shapes: { "series": [...] } or { "data": [...] } or { "prices": [...] } or {"close": ...}
+                prices = None
+                for k in ("series", "data", "prices", "items", "results"):
+                    if k in j:
+                        prices = j[k]
+                        break
+                # If the response is a signal (single value per date) or mapping date->value
+                if prices is None and isinstance(j, dict):
+                    # find likely date-key mapping
+                    date_keys = [k for k in j.keys() if isinstance(k, str) and k.count("-") == 2]
+                    if date_keys:
+                        prices = [{"date": k, **(j[k] if isinstance(j[k], dict) else {"close": j[k]})} for k in date_keys]
+                # If prices is still None, check if the object itself is a list of dicts
+                if prices is None and isinstance(j, list):
+                    prices = j
+                if not prices:
+                    logger.info("Tickerbot endpoint %s returned no usable prices (keys=%s)", url, list(j.keys())[:6])
+                    continue
+                df = pd.DataFrame(prices)
+                if "date" in df.columns:
+                    df["date"] = pd.to_datetime(df["date"])
+                    df = df.set_index("date").sort_index()
+                if "close" in df.columns and "Close" not in df.columns:
+                    df = df.rename(columns={"close": "Close"})
+                if "Close" in df.columns:
+                    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+                logger.info("Tickerbot for %s via %s returned shape=%s", ticker, url, getattr(df, "shape", None))
+                return df
+            except Exception as exc:
+                logger.info("Tickerbot request failed for %s on %s: %s", ticker, url, exc)
+                continue
+        return None
+
     def try_ticker_history(ticker):
         try:
             tk = yf.Ticker(ticker)
             hist = tk.history(start=test_start, end=end_plus1)
             logger.info("history() for %s returned shape=%s", ticker, None if hist is None else getattr(hist, "shape", None))
+            if hist is None or getattr(hist, "shape", (0,))[0] == 0:
+                # attempt to save raw Yahoo CSV for debugging
+                try:
+                    import calendar as _cal
+                    period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
+                    period2 = int(_cal.timegm(pd.to_datetime(test_end).timetuple())) + 24 * 3600
+                    raw_url = f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}?period1={period1}&period2={period2}&interval=1d&events=history&includeAdjustedClose=true"
+                    r = requests.get(raw_url, timeout=15)
+                    save_bytes(debug_dir / f"yf_raw_{ticker}_{test_start}_{test_end}.txt", r.content)
+                except Exception:
+                    pass
             return hist
         except Exception as exc:
             logger.info("Ticker.history() error for %s: %s", ticker, exc)
+            # try to capture raw Yahoo response
+            try:
+                import calendar as _cal
+                period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
+                period2 = int(_cal.timegm(pd.to_datetime(test_end).timetuple())) + 24 * 3600
+                raw_url = f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}?period1={period1}&period2={period2}&interval=1d&events=history&includeAdjustedClose=true"
+                r = requests.get(raw_url, timeout=15)
+                save_bytes(debug_dir / f"yf_raw_{ticker}_{test_start}_{test_end}.txt", r.content)
+            except Exception:
+                pass
             return None
 
     def try_yf_download(ticker):
         try:
-            # some yfinance versions accept progress/threads, others don't; try with those and fall back
             try:
                 df = yf.download(ticker, start=test_start, end=end_plus1, progress=False, threads=False)
             except TypeError:
                 df = yf.download(ticker, start=test_start, end=end_plus1)
             logger.info("yf.download for %s returned shape=%s", ticker, None if df is None else getattr(df, "shape", None))
+            if df is None or getattr(df, "shape", (0,))[0] == 0:
+                # capture raw CSV
+                try:
+                    import calendar as _cal
+                    period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
+                    period2 = int(_cal.timegm(pd.to_datetime(test_end).timetuple())) + 24 * 3600
+                    raw_url = f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}?period1={period1}&period2={period2}&interval=1d&events=history&includeAdjustedClose=true"
+                    r = requests.get(raw_url, timeout=15)
+                    save_bytes(debug_dir / f"yf_raw_{ticker}_{test_start}_{test_end}.txt", r.content)
+                except Exception:
+                    pass
             return df
         except Exception as exc:
             logger.info("yf.download error for %s: %s", ticker, exc)
+            # attempt raw fetch for debug
+            try:
+                import calendar as _cal
+                period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
+                period2 = int(_cal.timegm(pd.to_datetime(test_end).timetuple())) + 24 * 3600
+                raw_url = f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}?period1={period1}&period2={period2}&interval=1d&events=history&includeAdjustedClose=true"
+                r = requests.get(raw_url, timeout=15)
+                save_bytes(debug_dir / f"yf_raw_{ticker}_{test_start}_{test_end}.txt", r.content)
+            except Exception:
+                pass
             return None
 
     def try_pdr_stooq(ticker):
@@ -104,52 +210,28 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                 if df is not None and not df.empty:
                     df = df.sort_index()
                 logger.info("pandas_datareader(stooq) for %s returned shape=%s", symbol, None if df is None else getattr(df, "shape", None))
+                if df is None or getattr(df, "shape", (0,))[0] == 0:
+                    # try to capture stooq raw page for debug
+                    try:
+                        d1 = pd.to_datetime(test_start).strftime("%Y%m%d")
+                        d2 = pd.to_datetime(test_end).strftime("%Y%m%d")
+                        stooq_url = f"https://stooq.com/q/d/l/?s={symbol}&i=d&d1={d1}&d2={d2}"
+                        r = requests.get(stooq_url, timeout=15)
+                        save_bytes(debug_dir / f"stooq_raw_{symbol}_{test_start}_{test_end}.txt", r.content)
+                    except Exception:
+                        pass
                 return df
             except Exception as exc:
                 logger.info("pandas_datareader(stooq) failed for %s: %s", symbol, exc)
+                try:
+                    d1 = pd.to_datetime(test_start).strftime("%Y%m%d")
+                    d2 = pd.to_datetime(test_end).strftime("%Y%m%d")
+                    stooq_url = f"https://stooq.com/q/d/l/?s={symbol}&i=d&d1={d1}&d2={d2}"
+                    r = requests.get(stooq_url, timeout=15)
+                    save_bytes(debug_dir / f"stooq_raw_{symbol}_{test_start}_{test_end}.txt", r.content)
+                except Exception:
+                    pass
         return None
-
-    def try_tickerbot(ticker):
-        if not tickerbot_base:
-            logger.info("Tickerbot base URL not set; skipping tickerbot for %s", ticker)
-            return None
-        url = f"{tickerbot_base}/v1/tickers/{ticker}/series"
-        params = {"start": test_start, "end": test_end, "granularity": "d"}
-        headers = {}
-        if tickerbot_key:
-            headers["Authorization"] = f"Bearer {tickerbot_key}"
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=30)
-            resp.raise_for_status()
-            j = resp.json()
-            # try common keys
-            prices = None
-            for k in ("series", "data", "prices", "items"):
-                if k in j:
-                    prices = j[k]
-                    break
-            # fallback: if response is a mapping of date->values
-            if prices is None and isinstance(j, dict):
-                # detect date-like keys
-                date_keys = [k for k in j.keys() if isinstance(k, str) and k.count("-") == 2]
-                if date_keys:
-                    prices = [{"date": k, **(j[k] if isinstance(j[k], dict) else {"close": j[k]})} for k in date_keys]
-            if not prices:
-                logger.info("Tickerbot returned no prices for %s (keys=%s)", ticker, list(j.keys())[:6])
-                return None
-            df = pd.DataFrame(prices)
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"])
-                df = df.set_index("date").sort_index()
-            if "close" in df.columns and "Close" not in df.columns:
-                df = df.rename(columns={"close": "Close"})
-            if "Close" in df.columns:
-                df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-            logger.info("Tickerbot for %s returned shape=%s", ticker, getattr(df, "shape", None))
-            return df
-        except Exception as exc:
-            logger.info("Tickerbot request failed for %s: %s", ticker, exc)
-            return None
 
     def try_alpha_vantage(ticker):
         if not av_key:
@@ -159,16 +241,13 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
         params = {"function": "TIME_SERIES_DAILY_ADJUSTED", "symbol": ticker, "outputsize": "full", "apikey": av_key}
         try:
             resp = requests.get(url, params=params, timeout=30)
+            save_bytes(debug_dir / f"alphav_raw_{ticker}_{test_start}_{test_end}.txt", resp.content)
             resp.raise_for_status()
             j = resp.json()
-            ts_key = None
-            # AlphaVantage returns "Time Series (Daily)"
-            if "Time Series (Daily)" in j:
-                ts_key = "Time Series (Daily)"
-            if ts_key is None:
+            if "Time Series (Daily)" not in j:
                 logger.info("AlphaVantage returned no time series for %s: keys=%s", ticker, list(j.keys())[:6])
                 return None
-            data = j[ts_key]
+            data = j["Time Series (Daily)"]
             df = pd.DataFrame.from_dict(data, orient="index")
             df.index = pd.to_datetime(df.index)
             df = df.sort_index()
@@ -185,7 +264,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                     df = df.rename(columns={numeric_cols[-1]: "Close"})
                 else:
                     return None
-            # filter date range
             df = df[(df.index >= pd.to_datetime(test_start)) & (df.index <= pd.to_datetime(test_end))]
             logger.info("AlphaVantage for %s returned shape=%s", ticker, getattr(df, "shape", None))
             return df
@@ -193,11 +271,12 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             logger.info("AlphaVantage request failed for %s: %s", ticker, exc)
             return None
 
+    # Prefer tickerbot first for CI stability
     methods = [
+        ("tickerbot", try_tickerbot),
         ("history", try_ticker_history),
         ("download", try_yf_download),
         ("stooq", try_pdr_stooq),
-        ("tickerbot", try_tickerbot),
         ("alphavantage", try_alpha_vantage),
     ]
 
@@ -337,16 +416,14 @@ def compare_and_plot(tickers, start, end, train_years, test_months, fred_key=Non
         strat_r = f.get("strategy_return")
         if strat_r is None:
             strat_r = 0.0
-        # compute SPY return over same period using available sources (prefer yf.download - it's okay if earlier methods fail)
+        # compute SPY return over same period using available sources (prefer yf.download for SPY)
         try:
             spy_df = None
-            # try yf.download first (more likely to have standard Close column)
             try:
                 spy_df = yf.download("SPY", start=ts, end=(pd.to_datetime(te) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), progress=False, threads=False)
             except TypeError:
                 spy_df = yf.download("SPY", start=ts, end=(pd.to_datetime(te) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
             if spy_df is None or spy_df.empty or "Close" not in spy_df:
-                # fallback to Ticker.history
                 try:
                     spy_df = yf.Ticker("SPY").history(start=ts, end=(pd.to_datetime(te) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
                 except Exception:
