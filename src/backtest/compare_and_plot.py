@@ -39,8 +39,7 @@ def make_folds(start: str, end: str, train_years: int, test_months: int):
 def compute_returns_for_fold(tickers, test_start: str, test_end: str):
     """
     Multi-source, robust return computation.
-    Tries (priority): Tickerbot -> yfinance Ticker.history() -> yf.download() -> pandas_datareader (stooq) -> AlphaVantage
-    Writes small debug files to outputs/debug when raw responses are available.
+    Tickerbot (v2 history) is tried first. Debug outputs written to outputs/debug/.
     Returns a float (arithmetic mean across tickers if tickers is a list).
     """
     max_attempts = 3
@@ -82,11 +81,13 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
         if not tickerbot_base:
             logger.info("Tickerbot base URL not set; skipping tickerbot for %s", ticker)
             return None
-        # Try the primary "series" endpoint
+
+        # Try multiple likely Tickerbot endpoints; v2/history is first (per docs)
         endpoints = [
+            (f"{tickerbot_base}/v2/tickers/{ticker}/history", {"start": test_start, "end": test_end, "interval": "1d"}),
+            (f"{tickerbot_base}/v2/tickers/{ticker}/series", {"start": test_start, "end": test_end, "granularity": "d"}),
             (f"{tickerbot_base}/v1/tickers/{ticker}/series", {"start": test_start, "end": test_end, "granularity": "d"}),
-            (f"{tickerbot_base}/v1/tickers/{ticker}/signals/close", {"start": test_start, "end": test_end}),
-            (f"{tickerbot_base}/v1/tickers/{ticker}", {"start": test_start, "end": test_end}),
+            (f"{tickerbot_base}/tickers/{ticker}", {"start": test_start, "end": test_end}),
         ]
         headers = {}
         if tickerbot_key:
@@ -99,25 +100,21 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                 if resp.status_code != 200:
                     logger.info("Tickerbot returned status %s for %s", resp.status_code, url)
                     continue
-                # Try parse JSON
                 try:
                     j = resp.json()
                 except Exception:
                     logger.info("Tickerbot response not JSON for %s", url)
                     continue
-                # Common shapes: { "series": [...] } or { "data": [...] } or { "prices": [...] } or {"close": ...}
+                # Common shapes: { "series": [...] } or { "data": [...] } or { "prices": [...] } or mapping date->value
                 prices = None
                 for k in ("series", "data", "prices", "items", "results"):
                     if k in j:
                         prices = j[k]
                         break
-                # If the response is a signal (single value per date) or mapping date->value
                 if prices is None and isinstance(j, dict):
-                    # find likely date-key mapping
                     date_keys = [k for k in j.keys() if isinstance(k, str) and k.count("-") == 2]
                     if date_keys:
                         prices = [{"date": k, **(j[k] if isinstance(j[k], dict) else {"close": j[k]})} for k in date_keys]
-                # If prices is still None, check if the object itself is a list of dicts
                 if prices is None and isinstance(j, list):
                     prices = j
                 if not prices:
@@ -144,7 +141,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             hist = tk.history(start=test_start, end=end_plus1)
             logger.info("history() for %s returned shape=%s", ticker, None if hist is None else getattr(hist, "shape", None))
             if hist is None or getattr(hist, "shape", (0,))[0] == 0:
-                # attempt to save raw Yahoo CSV for debugging
                 try:
                     import calendar as _cal
                     period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
@@ -157,7 +153,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             return hist
         except Exception as exc:
             logger.info("Ticker.history() error for %s: %s", ticker, exc)
-            # try to capture raw Yahoo response
             try:
                 import calendar as _cal
                 period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
@@ -177,7 +172,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                 df = yf.download(ticker, start=test_start, end=end_plus1)
             logger.info("yf.download for %s returned shape=%s", ticker, None if df is None else getattr(df, "shape", None))
             if df is None or getattr(df, "shape", (0,))[0] == 0:
-                # capture raw CSV
                 try:
                     import calendar as _cal
                     period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
@@ -190,7 +184,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             return df
         except Exception as exc:
             logger.info("yf.download error for %s: %s", ticker, exc)
-            # attempt raw fetch for debug
             try:
                 import calendar as _cal
                 period1 = int(_cal.timegm(pd.to_datetime(test_start).timetuple()))
@@ -203,7 +196,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             return None
 
     def try_pdr_stooq(ticker):
-        # try both raw ticker and ticker + '.US' (stooq sometimes expects suffix)
         for symbol in (ticker, f"{ticker}.US"):
             try:
                 df = pdr.DataReader(symbol, "stooq", start=test_start, end=end_plus1)
@@ -211,7 +203,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
                     df = df.sort_index()
                 logger.info("pandas_datareader(stooq) for %s returned shape=%s", symbol, None if df is None else getattr(df, "shape", None))
                 if df is None or getattr(df, "shape", (0,))[0] == 0:
-                    # try to capture stooq raw page for debug
                     try:
                         d1 = pd.to_datetime(test_start).strftime("%Y%m%d")
                         d2 = pd.to_datetime(test_end).strftime("%Y%m%d")
@@ -251,7 +242,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             df = pd.DataFrame.from_dict(data, orient="index")
             df.index = pd.to_datetime(df.index)
             df = df.sort_index()
-            # normalized 'Close'
             if "5. adjusted close" in df.columns:
                 df = df.rename(columns={"5. adjusted close": "Close"})
                 df["Close"] = df["Close"].astype(float)
@@ -271,7 +261,6 @@ def compute_returns_for_fold(tickers, test_start: str, test_end: str):
             logger.info("AlphaVantage request failed for %s: %s", ticker, exc)
             return None
 
-    # Prefer tickerbot first for CI stability
     methods = [
         ("tickerbot", try_tickerbot),
         ("history", try_ticker_history),
