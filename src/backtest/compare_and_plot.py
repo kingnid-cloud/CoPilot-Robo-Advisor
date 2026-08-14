@@ -9,7 +9,21 @@ import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 
-from src.backtest.walkforward import run_walk_forward
+# robust import: bind the actual run function exported by src.backtest.walkforward
+import importlib
+
+wf_mod = importlib.import_module("src.backtest.walkforward")
+if hasattr(wf_mod, "run_walk_forward"):
+    run_walk_forward = wf_mod.run_walk_forward
+elif hasattr(wf_mod, "run_walkforward"):
+    run_walk_forward = wf_mod.run_walkforward
+elif hasattr(wf_mod, "run"):
+    run_walk_forward = wf_mod.run
+else:
+    raise ImportError(
+        "walkforward module does not expose a run function; looked for: "
+        "run_walk_forward, run_walkforward, run"
+    )
 
 logger = logging.getLogger("compare_backtest")
 logging.basicConfig(level=logging.INFO)
