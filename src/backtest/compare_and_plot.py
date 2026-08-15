@@ -466,4 +466,12 @@ def compute_returns_for_fold(
             return {"return": 0.0, "days": 0, "missing": 0, "source": "none"}
         avg_ret = float(sum(rets) / len(rets))
         avg_days = int(sum(days_list) / len(days_list))
-        expected_days = (pd.to_datetime(test_end) - pd
+        expected_days = (pd.to_datetime(test_end) - pd.to_datetime(test_start)).days + 1
+missing = max(0, expected_days - n)
+return {
+    "return": r,
+    "days": n,
+    "missing": missing,
+    "source": source_mode,
+}
+
