@@ -174,6 +174,22 @@ def _tickerbot_series(ticker: str, start: str, end: str, debug_dir: Path) -> pd.
         logger.info("Tickerbot /v2/series parse failed for %s: %s", ticker, exc)
         return None
 
+def _parse_series_json(ticker: str, j: dict) -> pd.DataFrame | None:
+    if "data" not in j or ticker not in j["data"]:
+        return None
+
+    rows = j["data"][ticker]
+    parsed = [{"date": r[0], "Close": r[1]} for r in rows]
+
+    df = pd.DataFrame(parsed)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    df = df.set_index("date").sort_index()
+
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df = df.dropna(subset=["Close"])
+
+    return df
 
 
 
