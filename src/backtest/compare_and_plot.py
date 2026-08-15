@@ -153,7 +153,6 @@ def _local_parquet_series(ticker: str, start: str, end: str, debug_dir: Path) ->
     except Exception as exc:
         logger.info("Local parquet load failed for %s: %s", ticker, exc)
         return None
-
 # ---------- data sources ----------
 
 def _tickerbot_series(ticker: str, start: str, end: str, debug_dir: Path) -> pd.DataFrame | None:
@@ -488,7 +487,7 @@ def compute_returns_for_fold(
         expected_days = (pd.to_datetime(test_end) - pd.to_datetime(test_start)).days + 1
         missing = max(0, expected_days - n)
 
-                return {
+        return {
             "return": r,
             "days": n,
             "missing": missing,
@@ -853,4 +852,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
