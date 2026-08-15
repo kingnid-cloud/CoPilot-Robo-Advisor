@@ -19,6 +19,8 @@ from dateutil.relativedelta import relativedelta
 logger = logging.getLogger("compare_backtest")
 logging.basicConfig(level=logging.INFO)
 
+# ---------- cached JSON helpers ----------
+
 def load_cached_series(ticker: str, start: str, end: str, cache_dir: Path):
     cache_file = cache_dir / f"{ticker}_{start}_{end}.json"
     if cache_file.exists():
@@ -129,10 +131,6 @@ def _parse_prices_from_json(j: object):
 # ---------- NEW: local parquet loader ----------
 
 def _local_parquet_series(ticker: str, start: str, end: str, debug_dir: Path) -> pd.DataFrame | None:
-    """
-    Load from local cache/SPY_price.parquet (or QQQ_price.parquet, VT_price.parquet).
-    This is your custom local data source.
-    """
     p = Path("cache") / f"{ticker}_price.parquet"
     if not p.exists():
         return None
@@ -398,7 +396,6 @@ def get_price_series(
     if cached is not None and not cached.empty:
         return cached
 
-    # ---------- INSERT LOCAL PARQUET FIRST ----------
     methods_auto = [
         ("local_parquet", _local_parquet_series),
         ("tickerbot_series", _tickerbot_series),
@@ -453,6 +450,7 @@ def compute_returns_for_fold(
     debug_dir = Path("outputs/debug")
     debug_dir.mkdir(parents=True, exist_ok=True)
 
+    # Multi-ticker case
     if isinstance(tickers, (list, tuple)) and len(tickers) > 1:
         rets = []
         days_list = []
@@ -462,16 +460,33 @@ def compute_returns_for_fold(
             if r is not None and n >= min_days:
                 rets.append(r)
                 days_list.append(n)
+
         if not rets:
             return {"return": 0.0, "days": 0, "missing": 0, "source": "none"}
+
         avg_ret = float(sum(rets) / len(rets))
         avg_days = int(sum(days_list) / len(days_list))
         expected_days = (pd.to_datetime(test_end) - pd.to_datetime(test_start)).days + 1
-missing = max(0, expected_days - n)
-return {
-    "return": r,
-    "days": n,
-    "missing": missing,
-    "source": source_mode,
-}
+        missing = max(0, expected_days - avg_days)
 
+        return {
+            "return": avg_ret,
+            "days": avg_days,
+            "missing": missing,
+            "source": source_mode,
+        }
+
+    # Single ticker case
+    else:
+        t = tickers[0] if isinstance(tickers, (list, tuple)) else tickers
+        df = get_price_series(t, test_start, test_end, source_mode, debug_dir)
+        r, n = _compute_from_df(df)
+
+        if r is None or n < min_days:
+            return {"return": 0.0, "days": n or 0, "missing": 0, "source": source_mode}
+
+        expected_days = (pd.to_datetime(test_end) - pd.to_datetime(test_start)).days + 1
+        missing = max(0, expected_days - n)
+
+        return {
+            "return": r
