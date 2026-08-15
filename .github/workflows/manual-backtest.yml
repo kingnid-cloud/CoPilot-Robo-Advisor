@@ -79,20 +79,20 @@ jobs:
             --out outputs/backtest \
             --source-mode "$SOURCE_MODE"
 
-      - name: Email backtest results
+            - name: Email backtest results
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.EMAIL_SMTP_USER }}
+          password: ${{ secrets.EMAIL_SMTP_PASS }}
           subject: "Walk-Forward Backtest Results"
           to: ${{ secrets.TO_EMAIL }}
-          from: "Backtest Bot <${{ secrets.SMTP_USERNAME }}>"
+          from: ${{ secrets.FROM_EMAIL }}
           body: |
             Hello Nidal,
 
-            Your walk-forward backtest has completed successfully.
+            Your CoPilot Robo-Advisor walk-forward backtest has completed successfully.
 
             Attached:
             - Equity curve (strategy vs SPY/QQQ/VT)
@@ -103,7 +103,7 @@ jobs:
             - JSON fold summary
 
             Best,
-            Copilot Backtest Engine
+            CoPilot Robo-Advisor Backtest Engine
           attachments: |
             outputs/backtest.equity.png
             outputs/backtest.folds.png
@@ -111,6 +111,7 @@ jobs:
             outputs/backtest.sharpe.png
             outputs/backtest.csv
             outputs/backtest.folds.json
+
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
