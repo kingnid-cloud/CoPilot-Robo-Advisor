@@ -129,9 +129,14 @@ def _parse_prices_from_json(j: object):
 # ---------- data sources ----------
 
 def _tickerbot_series(ticker: str, start: str, end: str, debug_dir: Path) -> pd.DataFrame | None:
-    """
-    Correct parser for Tickerbot /v2/series using from= and to=
-    """
+    cache_dir = Path("outputs/cache")
+
+    # 1. Try cache first
+    cached = load_cached_series(ticker, start, end, cache_dir)
+    if cached is not None:
+        return _parse_series_json(ticker, cached)
+
+    # 2. Otherwise call Tickerbot
     base = os.environ.get("TICKERBOT_URL", "").rstrip("/")
     key = os.environ.get("TICKERBOT_API_KEY", "")
     if not base:
@@ -150,37 +155,25 @@ def _tickerbot_series(ticker: str, start: str, end: str, debug_dir: Path) -> pd.
 
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=30)
+        raw_json = resp.json()
+
+        # Save raw JSON for debugging
         _save_debug_bytes(debug_dir / f"series_raw_{ticker}_{start}_{end}.json", resp.content)
 
-        if resp.status_code != 200:
+        # If rate-limited, return None (snapshot fallback will handle it)
+        if "error" in raw_json:
             return None
 
-        j = resp.json()
+        # Save to cache
+        save_cached_series(ticker, start, end, cache_dir, raw_json)
 
-        # Correct structure:
-        # j["data"][ticker] = [ [date, price], [date, price], ... ]
-        if "data" not in j or ticker not in j["data"]:
-            return None
-
-        rows = j["data"][ticker]
-        parsed = []
-        for row in rows:
-            date_str, price_val = row
-            parsed.append({"date": date_str, "Close": price_val})
-
-        df = pd.DataFrame(parsed)
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"])
-        df = df.set_index("date").sort_index()
-
-        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-        df = df.dropna(subset=["Close"])
-
-        return df
+        # Parse
+        return _parse_series_json(ticker, raw_json)
 
     except Exception as exc:
         logger.info("Tickerbot /v2/series parse failed for %s: %s", ticker, exc)
         return None
+
 
 
 
