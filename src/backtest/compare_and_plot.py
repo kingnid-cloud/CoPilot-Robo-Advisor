@@ -488,5 +488,369 @@ def compute_returns_for_fold(
         expected_days = (pd.to_datetime(test_end) - pd.to_datetime(test_start)).days + 1
         missing = max(0, expected_days - n)
 
-        return {
-            "return": r
+                return {
+            "return": r,
+            "days": n,
+            "missing": missing,
+            "source": source_mode,
+        }
+
+
+# ---------- walkforward adapter ----------
+
+def get_summary_with_adapters(
+    tickers,
+    start: str,
+    end: str,
+    train_years: int,
+    test_months: int,
+    fred_key: str | None = None,
+    source_mode: str = "auto",
+    min_days: int = 30,
+    parallel_workers: int = 4,
+):
+    try:
+        wf_mod = importlib.import_module("src.backtest.walkforward")
+        for name in ("run_walk_forward", "run_walkforward", "run", "execute", "walk_forward"):
+            if hasattr(wf_mod, name):
+                fn = getattr(wf_mod, name)
+                logger.info("Using walkforward function '%s' from src.backtest.walkforward", name)
+                try:
+                    return fn(
+                        tickers=tickers,
+                        start=start,
+                        end=end,
+                        train_years=train_years,
+                        test_months=test_months,
+                        fred_key=fred_key,
+                    )
+                except TypeError:
+                    try:
+                        return fn(tickers, start, end, train_years, test_months)
+                    except Exception:
+                        logger.warning("Found function '%s' but calling it failed; falling back.", name)
+                        break
+
+        if hasattr(wf_mod, "WalkForwardBacktester"):
+            logger.info("Found WalkForwardBacktester in module; attempting to use it")
+            cls = getattr(wf_mod, "WalkForwardBacktester")
+            try:
+                instance = cls()
+                for mname in ("run", "execute", "backtest", "run_walk_forward", "walk_forward"):
+                    if hasattr(instance, mname):
+                        m = getattr(instance, mname)
+                        logger.info("Calling WalkForwardBacktester.%s()", mname)
+                        try:
+                            return m(
+                                tickers=tickers,
+                                start=start,
+                                end=end,
+                                train_years=train_years,
+                                test_months=test_months,
+                            )
+                        except TypeError:
+                            try:
+                                return m(tickers, start, end, train_years, test_months)
+                            except Exception:
+                                logger.warning("Call to WalkForwardBacktester.%s failed; continuing", mname)
+
+                if hasattr(instance, "simple_report"):
+                    logger.info("Using simple_report fallback on WalkForwardBacktester")
+                    folds = make_folds(start, end, train_years, test_months)
+                    rows = []
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as ex:
+                        futures = {
+                            ex.submit(
+                                compute_returns_for_fold,
+                                tickers,
+                                f["test_start"],
+                                f["test_end"],
+                                source_mode,
+                                min_days,
+                            ): i
+                            for i, f in enumerate(folds)
+                        }
+                        for fut in concurrent.futures.as_completed(futures):
+                            i = futures[fut]
+                            res = fut.result()
+                            rows.append({"combined": res["return"]})
+
+                    portfolio_df = pd.DataFrame(rows)
+                    rep = instance.simple_report(portfolio_df)
+
+                    out_folds = []
+                    for i, f in enumerate(folds):
+                        strat_r = float(rep.iloc[i].get("combined", 0.0)) if i < len(rep) else 0.0
+                        out_folds.append(
+                            {
+                                "test_start": f["test_start"],
+                                "test_end": f["test_end"],
+                                "strategy_return": strat_r,
+                            }
+                        )
+                    return {"folds": out_folds}
+
+            except Exception as exc:
+                logger.warning("WalkForwardBacktester use failed: %s", exc)
+
+    except ModuleNotFoundError:
+        logger.info("src.backtest.walkforward not found; using builtin simple WF")
+
+    folds = make_folds(start, end, train_years, test_months)
+    out_folds = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as ex:
+        futures = {
+            ex.submit(
+                compute_returns_for_fold,
+                tickers,
+                f["test_start"],
+                f["test_end"],
+                source_mode,
+                min_days,
+            ): i
+            for i, f in enumerate(folds)
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            i = futures[fut]
+            res = fut.result()
+            f = folds[i]
+            out_folds.append(
+                {
+                    "test_start": f["test_start"],
+                    "test_end": f["test_end"],
+                    "strategy_return": res["return"],
+                    "days": res["days"],
+                    "missing": res["missing"],
+                    "source": res["source"],
+                }
+            )
+
+    out_folds = sorted(out_folds, key=lambda x: x["test_end"])
+    return {"folds": out_folds}
+
+
+# ---------- compare + plot ----------
+
+def compare_and_plot(
+    tickers,
+    start: str,
+    end: str,
+    train_years: int,
+    test_months: int,
+    fred_key: str | None = None,
+    out_prefix: Path | str = Path("outputs/backtest"),
+    source_mode: str = "auto",
+    min_days: int = 30,
+    parallel_workers: int = 4,
+):
+    out_prefix = Path(out_prefix)
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+
+    summary = get_summary_with_adapters(
+        tickers,
+        start,
+        end,
+        train_years,
+        test_months,
+        fred_key=fred_key,
+        source_mode=source_mode,
+        min_days=min_days,
+        parallel_workers=parallel_workers,
+    )
+    folds = summary.get("folds", [])
+
+    debug_dir = Path("outputs/debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    benchmarks = ["SPY", "QQQ", "VT"]
+    bench_series = {}
+    for b in benchmarks:
+        dfb = get_price_series(b, start, end, source_mode, debug_dir)
+        if dfb is not None and not dfb.empty:
+            bench_series[b] = dfb["Close"].dropna()
+
+    dates = []
+    strat_vals = []
+    bench_vals = {b: [] for b in benchmarks}
+    cum_strat = 1.0
+    cum_bench = {b: 1.0 for b in benchmarks}
+
+    fold_summaries = []
+
+    for f in folds:
+        ts = f.get("test_start")
+        te = f.get("test_end")
+        strat_r = f.get("strategy_return", 0.0)
+        days = f.get("days", None)
+        missing = f.get("missing", None)
+        source_used = f.get("source", source_mode)
+
+        bench_ret = {}
+        for b in benchmarks:
+            br = 0.0
+            try:
+                if b in bench_series:
+                    s = bench_series[b]
+                    mask = (s.index >= pd.to_datetime(ts)) & (s.index <= pd.to_datetime(te))
+                    sub = s[mask]
+                    if not sub.empty:
+                        entry = sub.iloc[0]
+                        exit_ = sub.iloc[-1]
+                        br = (exit_ / entry) - 1.0
+            except Exception:
+                br = 0.0
+            bench_ret[b] = br
+
+        cum_strat *= (1.0 + strat_r)
+        for b in benchmarks:
+            cum_bench[b] *= (1.0 + bench_ret[b])
+
+        dates.append(pd.to_datetime(te))
+        strat_vals.append(cum_strat)
+        for b in benchmarks:
+            bench_vals[b].append(cum_bench[b])
+
+        fold_summaries.append(
+            {
+                "test_start": ts,
+                "test_end": te,
+                "strategy_return": strat_r,
+                "cum_strategy": cum_strat,
+                "bench_returns": bench_ret,
+                "cum_benchmarks": {b: cum_bench[b] for b in benchmarks},
+                "days": days,
+                "missing": missing,
+                "source": source_used,
+            }
+        )
+
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "strategy_cum": strat_vals,
+            **{f"{b.lower()}_cum": bench_vals[b] for b in benchmarks},
+        }
+    )
+    df.to_csv(out_prefix.with_suffix(".csv"), index=False)
+
+    folds_json_path = out_prefix.with_suffix(".folds.json")
+    try:
+        folds_json_path.write_text(json.dumps(fold_summaries, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to write fold summary JSON: %s", exc)
+
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(df["date"], df["strategy_cum"], label="Strategy", linewidth=2)
+        for b in benchmarks:
+            plt.plot(df["date"], df[f"{b.lower()}_cum"], label=b, linewidth=2)
+        plt.xlabel("Date")
+        plt.ylabel("Cumulative value (start = 1.0)")
+        plt.title("Walk-forward backtest vs SPY / QQQ / VT")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(out_prefix.with_suffix(".equity.png"))
+        plt.close()
+
+        fold_dates = [pd.to_datetime(f["test_end"]) for f in fold_summaries]
+        fold_rets = [f["strategy_return"] for f in fold_summaries]
+        plt.figure(figsize=(10, 4))
+        plt.bar(fold_dates, fold_rets, width=10)
+        plt.axhline(0.0, color="black", linewidth=1)
+        plt.xlabel("Fold end date")
+        plt.ylabel("Fold return")
+        plt.title("Fold-level strategy returns")
+        plt.tight_layout()
+        plt.savefig(out_prefix.with_suffix(".folds.png"))
+        plt.close()
+
+        days_arr = np.array([f["days"] or 0 for f in fold_summaries])
+        missing_arr = np.array([f["missing"] or 0 for f in fold_summaries])
+        quality = np.clip(days_arr / (days_arr + missing_arr + 1e-9), 0.0, 1.0)
+        plt.figure(figsize=(10, 2))
+        plt.imshow(
+            quality.reshape(1, -1),
+            aspect="auto",
+            cmap="viridis",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        plt.colorbar(label="Data quality (1 = full)")
+        plt.xticks(
+            range(len(fold_dates)),
+            [d.strftime("%Y-%m") for d in fold_dates],
+            rotation=90,
+        )
+        plt.yticks([])
+        plt.title("Fold data quality heatmap")
+        plt.tight_layout()
+        plt.savefig(out_prefix.with_suffix(".quality.png"))
+        plt.close()
+
+        rets = np.array(fold_rets)
+        window = max(3, min(12, len(rets)))
+        roll_sharpe = []
+        for i in range(len(rets)):
+            if i + 1 < window:
+                roll_sharpe.append(np.nan)
+            else:
+                rwin = rets[i + 1 - window : i + 1]
+                mu = np.mean(rwin)
+                sigma = np.std(rwin)
+                roll_sharpe.append(mu / sigma if sigma > 1e-9 else np.nan)
+        plt.figure(figsize=(10, 4))
+        plt.plot(fold_dates, roll_sharpe, label=f"Rolling Sharpe (window={window})")
+        plt.axhline(0.0, color="black", linewidth=1)
+        plt.xlabel("Fold end date")
+        plt.ylabel("Sharpe (approx)")
+        plt.title("Rolling Sharpe across folds")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(out_prefix.with_suffix(".sharpe.png"))
+        plt.close()
+
+    except Exception as exc:
+        logger.warning("Failed to plot backtest results: %s", exc)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Compare walk-forward backtest vs SPY/QQQ/VT")
+    parser.add_argument("--tickers", nargs="+", required=True)
+    parser.add_argument("--start", required=True)
+    parser.add_argument("--end", required=True)
+    parser.add_argument("--train-years", type=int, required=True)
+    parser.add_argument("--test-months", type=int, required=True)
+    parser.add_argument("--out", type=str, default="outputs/backtest")
+    parser.add_argument("--fred-key", type=str, default=None)
+    parser.add_argument(
+        "--source-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "tickerbot", "snapshot", "fmp", "yf"],
+    )
+    parser.add_argument("--min-days", type=int, default=30)
+    parser.add_argument("--workers", type=int, default=4)
+
+    args = parser.parse_args()
+    compare_and_plot(
+        tickers=args.tickers,
+        start=args.start,
+        end=args.end,
+        train_years=args.train_years,
+        test_months=args.test_months,
+        fred_key=args.fred_key,
+        out_prefix=args.out,
+        source_mode=args.source_mode,
+        min_days=args.min_days,
+        parallel_workers=args.workers,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
